@@ -7,7 +7,6 @@
 #import <stddef.h>
 #import <string.h>
 #import <vector>
-#import <UIKit/UIKit.h>
 
 // Imgui library
 #import "Esp/CaptainHook.h"
@@ -27,9 +26,6 @@
 #define kWidth  [UIScreen mainScreen].bounds.size.width
 #define kHeight [UIScreen mainScreen].bounds.size.height
 #define kScale  [UIScreen mainScreen].scale
-
-// --- Logging helper ---
-#define LOG(fmt, ...) NSLog(@"[URP] " fmt, ##__VA_ARGS__)
 
 // --- Vector structures ---
 struct Vector3 { float X, Y, Z; };
@@ -52,22 +48,15 @@ static int g_ProjMatOff = 0x70;
 static ImVec2 g_MenuWindowPos = ImVec2(0,0);
 static ImVec2 g_MenuWindowSize = ImVec2(0,0);
 
-// --- Safe Memory Reader with error logging ---
+// --- Safe Memory Reader ---
 template <typename T>
 static inline T ReadMemory(uintptr_t address, T defaultValue = T()) {
-    if (!address || address < 0x10000000 || address > 0x3000000000) {
-        LOG(@"ReadMemory: invalid address 0x%lx", address);
-        return defaultValue;
-    }
+    if (!address || address < 0x10000000 || address > 0x3000000000) return defaultValue;
     T buffer;
     vm_size_t size = 0;
     kern_return_t kr = vm_read_overwrite(mach_task_self(), (vm_address_t)address, sizeof(T), (vm_address_t)&buffer, &size);
-    if (kr == KERN_SUCCESS && size == sizeof(T)) {
-        return buffer;
-    } else {
-        LOG(@"ReadMemory: vm_read failed at 0x%lx, error %d", address, kr);
-        return defaultValue;
-    }
+    if (kr == KERN_SUCCESS && size == sizeof(T)) return buffer;
+    return defaultValue;
 }
 
 // --- VTable validation ---
@@ -79,7 +68,7 @@ static bool IsValidVTable(uintptr_t obj) {
 }
 
 // --------------------------------------------------------------------
-// Matrix detection functions
+// Matrix detection functions (MUST be defined before ScanOffsets)
 // --------------------------------------------------------------------
 struct FMinimalViewInfo {
     Vector3 Location;
@@ -93,76 +82,60 @@ struct FCameraCacheEntry {
 };
 
 static bool DetectMatrixOffsets(uintptr_t CameraManager, int& outViewOff, int& outProjOff) {
-    @try {
-        if (!CameraManager) return false;
-        uintptr_t cacheAddr = CameraManager + 0x4B0;
-        FCameraCacheEntry cache = ReadMemory<FCameraCacheEntry>(cacheAddr);
-        if (cache.Timestamp == 0) return false;
-        uintptr_t povAddr = cacheAddr + offsetof(FCameraCacheEntry, POV);
-        int candidates[] = {0x10,0x20,0x30,0x40,0x50,0x60,0x70,0x80,0x90,0xA0,0xB0,0xC0};
-        for (int vOff : candidates) {
-            for (int pOff : candidates) {
-                if (vOff == pOff) continue;
-                float view[16], proj[16];
-                memcpy(view, (void*)(povAddr + vOff), 16*sizeof(float));
-                memcpy(proj, (void*)(povAddr + pOff), 16*sizeof(float));
-                float sum = 0; for (int i=0;i<16;i++) sum += fabsf(view[i]);
-                if (sum < 0.1f) continue;
-                sum = 0; for (int i=0;i<16;i++) sum += fabsf(proj[i]);
-                if (sum < 0.1f) continue;
-                outViewOff = vOff;
-                outProjOff = pOff;
-                LOG(@"Detected matrix offsets: View=0x%X, Proj=0x%X", vOff, pOff);
-                return true;
-            }
+    if (!CameraManager) return false;
+    uintptr_t cacheAddr = CameraManager + 0x4B0; // OFF_CameraCache (common)
+    FCameraCacheEntry cache = ReadMemory<FCameraCacheEntry>(cacheAddr);
+    if (cache.Timestamp == 0) return false;
+    uintptr_t povAddr = cacheAddr + offsetof(FCameraCacheEntry, POV);
+    int candidates[] = {0x10,0x20,0x30,0x40,0x50,0x60,0x70,0x80,0x90,0xA0,0xB0,0xC0};
+    for (int vOff : candidates) {
+        for (int pOff : candidates) {
+            if (vOff == pOff) continue;
+            float view[16], proj[16];
+            memcpy(view, (void*)(povAddr + vOff), 16*sizeof(float));
+            memcpy(proj, (void*)(povAddr + pOff), 16*sizeof(float));
+            float sum = 0; for (int i=0;i<16;i++) sum += fabsf(view[i]);
+            if (sum < 0.1f) continue;
+            sum = 0; for (int i=0;i<16;i++) sum += fabsf(proj[i]);
+            if (sum < 0.1f) continue;
+            outViewOff = vOff;
+            outProjOff = pOff;
+            return true;
         }
-        LOG(@"DetectMatrixOffsets: no valid pair found");
-        return false;
-    } @catch (NSException *e) {
-        LOG(@"DetectMatrixOffsets exception: %@", e);
-        return false;
     }
+    return false;
 }
+// --------------------------------------------------------------------
 
-// --- Pattern scanning for GNames ---
+// --- Pattern scanning for GNames (look for "None" string) ---
 static uintptr_t FindGNames() {
-    @try {
-        const char* pattern = "None";
-        size_t len = strlen(pattern);
-        uintptr_t end = g_BaseAddress + 0x1000000;
-        for (uintptr_t addr = g_BaseAddress; addr < end; ++addr) {
-            char buf[5] = {0};
-            vm_size_t size = 0;
-            if (vm_read_overwrite(mach_task_self(), (vm_address_t)addr, len, (vm_address_t)buf, &size) == KERN_SUCCESS && size == len) {
-                if (strncmp(buf, pattern, len) == 0) {
-                    for (uintptr_t p = g_BaseAddress; p < g_BaseAddress + 0x1000000; p += 4) {
-                        uintptr_t ptr = ReadMemory<uintptr_t>(p);
-                        if (ptr == addr) {
-                            LOG(@"Found GNames at 0x%lx (offset 0x%lx)", p, p - g_BaseAddress);
-                            return p;
-                        }
+    const char* pattern = "None";
+    size_t len = strlen(pattern);
+    uintptr_t end = g_BaseAddress + 0x1000000; // scan first 16MB
+    for (uintptr_t addr = g_BaseAddress; addr < end; ++addr) {
+        char buf[5];
+        vm_size_t size = 0;
+        if (vm_read_overwrite(mach_task_self(), (vm_address_t)addr, len, (vm_address_t)buf, &size) == KERN_SUCCESS && size == len) {
+            if (strncmp(buf, pattern, len) == 0) {
+                // Found "None" – now scan for a pointer to this address
+                for (uintptr_t p = g_BaseAddress; p < g_BaseAddress + 0x1000000; p += 4) {
+                    uintptr_t ptr = ReadMemory<uintptr_t>(p);
+                    if (ptr == addr) {
+                        return p; // pointer location (offset)
                     }
-                    break;
                 }
+                break;
             }
         }
-        LOG(@"FindGNames: not found");
-        return 0;
-    } @catch (NSException *e) {
-        LOG(@"FindGNames exception: %@", e);
-        return 0;
     }
+    return 0;
 }
 
-// --- Enhanced scanner with logging ---
+// --- Enhanced scanner ---
 static void ScanOffsets() {
-    LOG(@"ScanOffsets started");
-    if (!g_BaseAddress) {
-        LOG(@"Base address not set");
-        return;
-    }
+    if (!g_BaseAddress) return;
 
-    // 1. Find GWorld
+    // 1. Find GWorld via heuristic scanning
     for (int off = 0; off < 0x1000; off += 4) {
         uintptr_t ptr = ReadMemory<uintptr_t>(g_BaseAddress + off);
         if (ptr > 0x10000000 && ptr < 0x3000000000) {
@@ -173,7 +146,6 @@ static void ScanOffsets() {
                     int count = ReadMemory<int>(level + 0xA8);
                     if (actors > 0x10000000 && count > 0 && count < 5000) {
                         g_GWorld = ptr;
-                        LOG(@"Found GWorld at 0x%lx (offset 0x%lx)", ptr, off);
                         break;
                     }
                 }
@@ -182,7 +154,7 @@ static void ScanOffsets() {
     }
 
     if (g_GWorld) {
-        // GameInstance
+        // Find GameInstance (try common offsets)
         for (int off = 0x20; off < 0x100; off += 4) {
             uintptr_t gi = ReadMemory<uintptr_t>(g_GWorld + off);
             if (gi > 0x10000000 && IsValidVTable(gi)) {
@@ -190,6 +162,7 @@ static void ScanOffsets() {
                 if (lpArray > 0x10000000) {
                     uintptr_t lp = ReadMemory<uintptr_t>(lpArray);
                     if (lp > 0x10000000 && IsValidVTable(lp)) {
+                        // LocalPlayer found
                         for (int pcOff = 0x20; pcOff < 0x80; pcOff += 4) {
                             uintptr_t pc = ReadMemory<uintptr_t>(lp + pcOff);
                             if (pc > 0x10000000 && IsValidVTable(pc)) {
@@ -197,7 +170,6 @@ static void ScanOffsets() {
                                 if (cam > 0x10000000 && IsValidVTable(cam)) {
                                     g_Controller = pc;
                                     g_CameraManager = cam;
-                                    LOG(@"Found Controller at 0x%lx, CameraManager at 0x%lx", pc, cam);
                                     break;
                                 }
                             }
@@ -208,7 +180,7 @@ static void ScanOffsets() {
             }
         }
 
-        // Level + ActorArray
+        // Find PersistentLevel and ActorArray
         for (int off = 0x20; off < 0x100; off += 4) {
             uintptr_t level = ReadMemory<uintptr_t>(g_GWorld + off);
             if (level > 0x10000000 && IsValidVTable(level)) {
@@ -217,19 +189,18 @@ static void ScanOffsets() {
                 if (actors > 0x10000000 && count > 0 && count < 5000) {
                     g_ActorArray = actors;
                     g_ActorCount = count;
-                    LOG(@"Found ActorArray at 0x%lx, Count %d", actors, count);
                     break;
                 }
             }
         }
     }
 
-    // GNames
+    // 2. Find GNames (using pattern scan)
     if (!g_GNames) {
         g_GNames = FindGNames();
     }
 
-    // GUObjectArray
+    // 3. Find GUObjectArray (scan for pointer to an array of UObjects)
     if (!g_GUObjectArray) {
         for (int off = 0; off < 0x1000000; off += 4) {
             uintptr_t ptr = ReadMemory<uintptr_t>(g_BaseAddress + off);
@@ -239,7 +210,6 @@ static void ScanOffsets() {
                     uintptr_t classPriv = ReadMemory<uintptr_t>(firstObj + 0x10);
                     if (classPriv > 0x10000000 && IsValidVTable(classPriv)) {
                         g_GUObjectArray = ptr;
-                        LOG(@"Found GUObjectArray at 0x%lx", ptr);
                         break;
                     }
                 }
@@ -247,7 +217,7 @@ static void ScanOffsets() {
         }
     }
 
-    // Matrix offsets
+    // 4. Auto‑detect matrix offsets
     if (g_CameraManager) {
         int vOff, pOff;
         if (DetectMatrixOffsets(g_CameraManager, vOff, pOff)) {
@@ -255,24 +225,18 @@ static void ScanOffsets() {
             g_ProjMatOff = pOff;
         }
     }
-    LOG(@"ScanOffsets completed");
 }
 
 // --- W2S ---
 static bool GetViewProjectionMatrices(uintptr_t CameraManager, float* outViewMatrix, float* outProjMatrix) {
-    @try {
-        if (!CameraManager) return false;
-        uintptr_t cacheAddr = CameraManager + 0x4B0;
-        FCameraCacheEntry cache = ReadMemory<FCameraCacheEntry>(cacheAddr);
-        if (cache.Timestamp == 0) return false;
-        uintptr_t povAddr = cacheAddr + offsetof(FCameraCacheEntry, POV);
-        memcpy(outViewMatrix, (void*)(povAddr + g_ViewMatOff), 16 * sizeof(float));
-        memcpy(outProjMatrix, (void*)(povAddr + g_ProjMatOff), 16 * sizeof(float));
-        return true;
-    } @catch (NSException *e) {
-        LOG(@"GetViewProjectionMatrices exception: %@", e);
-        return false;
-    }
+    if (!CameraManager) return false;
+    uintptr_t cacheAddr = CameraManager + 0x4B0;
+    FCameraCacheEntry cache = ReadMemory<FCameraCacheEntry>(cacheAddr);
+    if (cache.Timestamp == 0) return false;
+    uintptr_t povAddr = cacheAddr + offsetof(FCameraCacheEntry, POV);
+    memcpy(outViewMatrix, (void*)(povAddr + g_ViewMatOff), 16 * sizeof(float));
+    memcpy(outProjMatrix, (void*)(povAddr + g_ProjMatOff), 16 * sizeof(float));
+    return true;
 }
 
 static bool ProjectWorldToScreen(Vector3 worldPos, Vector2& screenPos, float* viewMatrix, float* projMatrix, int screenWidth, int screenHeight) {
@@ -299,7 +263,9 @@ static bool show_ESPLine = true;
 static bool show_ESPDistance = true;
 static bool show_Diagnostics = true;
 static bool scanRequested = false;
-static char scanResult[1024] = "Press 'Scan Offsets' to find offsets.";
+static char scanResult[1024] = "Auto‑scan will start shortly...";
+static bool autoScanDone = false;
+static dispatch_source_t scanTimer = nil;
 
 // ---- ImGuiDrawView ----
 @interface ImGuiDrawView () <MTKViewDelegate>
@@ -323,7 +289,6 @@ void _huy(void *instance) { huy(instance); }
     ImGui::StyleColorsClassic();
     ImFont* font = io.Fonts->AddFontFromMemoryCompressedTTF((void*)Honkai_compressed_data, Honkai_compressed_size, 45.0f, NULL, io.Fonts->GetGlyphRangesDefault());
     ImGui_ImplMetal_Init(_device);
-    LOG(@"ImGuiDrawView initialized");
     return self;
 }
 
@@ -336,7 +301,6 @@ void _huy(void *instance) { huy(instance); }
     self.view = [[MTKView alloc] initWithFrame:CGRectMake(0, 0, w, h)];
     self.view.backgroundColor = [UIColor clearColor];
     self.view.opaque = NO;
-    LOG(@"loadView: size %fx%f", w, h);
 }
 
 - (void)viewDidLoad {
@@ -347,14 +311,45 @@ void _huy(void *instance) { huy(instance); }
     self.mtkView.backgroundColor = [UIColor colorWithRed:0 green:0 blue:0 alpha:0];
     self.mtkView.clipsToBounds = YES;
     self.view.userInteractionEnabled = YES;
-    LOG(@"viewDidLoad");
+    
+    // --- Auto‑scan after 6 seconds ---
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (!autoScanDone) {
+            ScanOffsets();
+            autoScanDone = YES;
+            // Update scan result string
+            snprintf(scanResult, sizeof(scanResult),
+                     "GWorld: 0x%lx\nGNames: 0x%lx\nGUObjectArray: 0x%lx\n"
+                     "World: 0x%lx\nController: 0x%lx\nCameraManager: 0x%lx\n"
+                     "ActorArray: 0x%lx\nActorCount: %d\nViewMatOff: 0x%X\nProjMatOff: 0x%X",
+                     g_GWorld, g_GNames, g_GUObjectArray,
+                     g_World, g_Controller, g_CameraManager,
+                     g_ActorArray, g_ActorCount, g_ViewMatOff, g_ProjMatOff);
+            // If some offsets missing, schedule re-scan after 10 sec
+            if (!g_GWorld || !g_GNames || !g_GUObjectArray || !g_ActorArray) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    // Re‑scan
+                    ScanOffsets();
+                    snprintf(scanResult, sizeof(scanResult),
+                             "GWorld: 0x%lx\nGNames: 0x%lx\nGUObjectArray: 0x%lx\n"
+                             "World: 0x%lx\nController: 0x%lx\nCameraManager: 0x%lx\n"
+                             "ActorArray: 0x%lx\nActorCount: %d\nViewMatOff: 0x%X\nProjMatOff: 0x%X",
+                             g_GWorld, g_GNames, g_GUObjectArray,
+                             g_World, g_Controller, g_CameraManager,
+                             g_ActorArray, g_ActorCount, g_ViewMatOff, g_ProjMatOff);
+                });
+            }
+        }
+    });
 }
 
-#pragma mark - Hit-testing
+#pragma mark - Hit-testing to pass touches through to game
 
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
+    // If menu is closed, never capture touches
     if (!MenDeal) return NO;
-    if (g_MenuWindowSize.x == 0 && g_MenuWindowSize.y == 0) return YES;
+    // If menu window size is zero (not yet drawn), don't capture
+    if (g_MenuWindowSize.x == 0 && g_MenuWindowSize.y == 0) return NO;
     ImVec2 pos = g_MenuWindowPos;
     ImVec2 size = g_MenuWindowSize;
     CGRect menuRect = CGRectMake(pos.x, pos.y, size.x, size.y);
@@ -394,157 +389,140 @@ void _huy(void *instance) { huy(instance); }
 #pragma mark - MTKViewDelegate
 
 - (void)drawInMTKView:(MTKView*)view {
-    @try {
-        ImGuiIO& io = ImGui::GetIO();
-        io.DisplaySize.x = view.bounds.size.width;
-        io.DisplaySize.y = view.bounds.size.height;
-        CGFloat framebufferScale = view.window.screen.scale ?: UIScreen.mainScreen.scale;
-        io.DisplayFramebufferScale = ImVec2(framebufferScale, framebufferScale);
-        io.DeltaTime = 1 / float(view.preferredFramesPerSecond ?: 120);
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize.x = view.bounds.size.width;
+    io.DisplaySize.y = view.bounds.size.height;
+    CGFloat framebufferScale = view.window.screen.scale ?: UIScreen.mainScreen.scale;
+    io.DisplayFramebufferScale = ImVec2(framebufferScale, framebufferScale);
+    io.DeltaTime = 1 / float(view.preferredFramesPerSecond ?: 120);
 
-        id<MTLCommandBuffer> commandBuffer = [self.commandQueue commandBuffer];
+    id<MTLCommandBuffer> commandBuffer = [self.commandQueue commandBuffer];
 
-        MTLRenderPassDescriptor* renderPassDescriptor = view.currentRenderPassDescriptor;
-        if (renderPassDescriptor != nil) {
-            id <MTLRenderCommandEncoder> renderEncoder = [commandBuffer renderCommandEncoderWithDescriptor:renderPassDescriptor];
-            [renderEncoder pushDebugGroup:@"ImGui"];
+    MTLRenderPassDescriptor* renderPassDescriptor = view.currentRenderPassDescriptor;
+    if (renderPassDescriptor != nil) {
+        id <MTLRenderCommandEncoder> renderEncoder = [commandBuffer renderCommandEncoderWithDescriptor:renderPassDescriptor];
+        [renderEncoder pushDebugGroup:@"ImGui"];
 
-            ImGui_ImplMetal_NewFrame(renderPassDescriptor);
-            ImGui::NewFrame();
+        ImGui_ImplMetal_NewFrame(renderPassDescriptor);
+        ImGui::NewFrame();
 
-            ImFont* font = ImGui::GetFont();
-            font->Scale = 15.f / font->FontSize;
+        ImFont* font = ImGui::GetFont();
+        font->Scale = 15.f / font->FontSize;
 
-            CGFloat x = (view.bounds.size.width - 400) / 2;
-            CGFloat y = (view.bounds.size.height - 350) / 2;
-            ImGui::SetNextWindowPos(ImVec2(x, y), ImGuiCond_FirstUseEver);
-            ImGui::SetNextWindowSize(ImVec2(400, 350), ImGuiCond_FirstUseEver);
+        CGFloat x = (view.bounds.size.width - 400) / 2;
+        CGFloat y = (view.bounds.size.height - 350) / 2;
+        ImGui::SetNextWindowPos(ImVec2(x, y), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(400, 350), ImGuiCond_FirstUseEver);
 
-            if (MenDeal) {
-                ImGui::Begin("URP Overlay", &MenDeal);
-                ImGui::Text("Overlay Framework Active");
-                ImGui::Separator();
-                ImGui::Checkbox("Player 2D Box", &show_ESPBox);
-                ImGui::Checkbox("Player Snaplines", &show_ESPLine);
-                ImGui::Checkbox("Player Distance", &show_ESPDistance);
-                ImGui::Checkbox("Show Offset Inspector", &show_Diagnostics);
-                if (ImGui::Button("Scan Offsets")) {
-                    scanRequested = true;
-                }
-                ImGui::SameLine();
-                ImGui::Text("(runtime finder)");
-                ImGui::Separator();
-                ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
-                ImGui::End();
+        // --- Menu ---
+        if (MenDeal) {
+            ImGui::Begin("URP Overlay", &MenDeal);
+            ImGui::Text("Overlay Framework Active");
+            ImGui::Separator();
+            ImGui::Checkbox("Player 2D Box", &show_ESPBox);
+            ImGui::Checkbox("Player Snaplines", &show_ESPLine);
+            ImGui::Checkbox("Player Distance", &show_ESPDistance);
+            ImGui::Checkbox("Show Offset Inspector", &show_Diagnostics);
+            ImGui::Separator();
+            ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
+            ImGui::End();
 
-                g_MenuWindowPos = ImGui::GetWindowPos();
-                g_MenuWindowSize = ImGui::GetWindowSize();
-            } else {
-                g_MenuWindowSize = ImVec2(0,0);
-            }
-
-            // Perform scan
-            if (scanRequested) {
-                ScanOffsets();
-                snprintf(scanResult, sizeof(scanResult),
-                         "GWorld: 0x%lx\nGNames: 0x%lx\nGUObjectArray: 0x%lx\n"
-                         "World: 0x%lx\nController: 0x%lx\nCameraManager: 0x%lx\n"
-                         "ActorArray: 0x%lx\nActorCount: %d\nViewMatOff: 0x%X\nProjMatOff: 0x%X",
-                         g_GWorld, g_GNames, g_GUObjectArray,
-                         g_World, g_Controller, g_CameraManager,
-                         g_ActorArray, g_ActorCount, g_ViewMatOff, g_ProjMatOff);
-                scanRequested = false;
-            }
-
-            // ESP Drawing
-            ImDrawList* drawList = ImGui::GetForegroundDrawList();
-            float viewWidth = view.bounds.size.width;
-            float viewHeight = view.bounds.size.height;
-
-            float viewMat[16] = {0}, projMat[16] = {0};
-            bool w2sReady = false;
-            if (g_CameraManager) {
-                w2sReady = GetViewProjectionMatrices(g_CameraManager, viewMat, projMat);
-            }
-
-            if (g_ActorArray && g_ActorCount > 0 && g_Controller && w2sReady) {
-                for (int i = 0; i < g_ActorCount; i++) {
-                    uintptr_t actor = ReadMemory<uintptr_t>(g_ActorArray + (i * sizeof(uintptr_t)));
-                    if (!actor) continue;
-                    uintptr_t rootOffsets[] = {0x140, 0x130, 0x138, 0x148, 0x180};
-                    uintptr_t rootComp = 0;
-                    for (int r = 0; r < 5; r++) {
-                        rootComp = ReadMemory<uintptr_t>(actor + rootOffsets[r]);
-                        if (rootComp > 0x10000000 && IsValidVTable(rootComp)) break;
-                    }
-                    if (!rootComp) continue;
-                    Vector3 actorPos = ReadMemory<Vector3>(rootComp + 0x120);
-                    if (actorPos.X == 0 && actorPos.Y == 0 && actorPos.Z == 0) continue;
-                    Vector3 headPos = actorPos; headPos.Z += 80.0f;
-                    Vector3 feetPos = actorPos; feetPos.Z -= 80.0f;
-                    Vector2 screenHead, screenFeet, screenPos;
-                    if (ProjectWorldToScreen(headPos, screenHead, viewMat, projMat, viewWidth, viewHeight) &&
-                        ProjectWorldToScreen(feetPos, screenFeet, viewMat, projMat, viewWidth, viewHeight) &&
-                        ProjectWorldToScreen(actorPos, screenPos, viewMat, projMat, viewWidth, viewHeight)) {
-                        float boxHeight = fabsf(screenFeet.Y - screenHead.Y);
-                        float boxWidth = boxHeight / 2.0f;
-                        float boxLeft = screenHead.X - (boxWidth / 2.0f);
-                        if (show_ESPLine) {
-                            drawList->AddLine(ImVec2(viewWidth/2, 60), ImVec2(screenHead.X, screenHead.Y), IM_COL32(255,235,59,255), 1.5f);
-                        }
-                        if (show_ESPBox) {
-                            drawList->AddRect(ImVec2(boxLeft, screenHead.Y), ImVec2(boxLeft+boxWidth, screenFeet.Y), IM_COL32(255,40,40,255), 0.0f, 0, 1.6f);
-                        }
-                        if (show_ESPDistance) {
-                            float dist = sqrtf(actorPos.X*actorPos.X + actorPos.Y*actorPos.Y + actorPos.Z*actorPos.Z) / 100.0f;
-                            char txt[32]; snprintf(txt, sizeof(txt), "%.1fm", dist);
-                            drawList->AddText(ImVec2(screenHead.X-10, screenHead.Y-20), IM_COL32(255,255,255,255), txt);
-                        }
-                    }
-                }
-            }
-
-            // Diagnostics Overlay
-            if (show_Diagnostics) {
-                char debugText[1024];
-                snprintf(debugText, sizeof(debugText),
-                         "[Engine Inspector]\n"
-                         "Base: 0x%lx\n"
-                         "GWorld: 0x%lx\n"
-                         "GNames: 0x%lx\n"
-                         "GUObject: 0x%lx\n"
-                         "World: 0x%lx\n"
-                         "Controller: 0x%lx\n"
-                         "CamMgr: 0x%lx\n"
-                         "ActorArr: 0x%lx\n"
-                         "ActorCount: %d\n"
-                         "ViewMatOff: 0x%X\n"
-                         "ProjMatOff: 0x%X\n"
-                         "--- Scan Result ---\n%s",
-                         g_BaseAddress,
-                         g_GWorld, g_GNames, g_GUObjectArray,
-                         g_World, g_Controller, g_CameraManager,
-                         g_ActorArray, g_ActorCount,
-                         g_ViewMatOff, g_ProjMatOff,
-                         scanResult);
-                drawList->AddRectFilled(ImVec2(20,40), ImVec2(380, 320), IM_COL32(10,15,25,210), 6.0f);
-                drawList->AddRect(ImVec2(20,40), ImVec2(380, 320), IM_COL32(0,255,200,180), 6.0f);
-                drawList->AddText(ImVec2(28,46), IM_COL32(255,255,255,255), debugText);
-            }
-
-            ImGui::Render();
-            ImDrawData* draw_data = ImGui::GetDrawData();
-            ImGui_ImplMetal_RenderDrawData(draw_data, commandBuffer, renderEncoder);
-
-            [renderEncoder popDebugGroup];
-            [renderEncoder endEncoding];
-            [commandBuffer presentDrawable:view.currentDrawable];
+            g_MenuWindowPos = ImGui::GetWindowPos();
+            g_MenuWindowSize = ImGui::GetWindowSize();
+        } else {
+            g_MenuWindowSize = ImVec2(0,0);
         }
 
-        [commandBuffer commit];
-    } @catch (NSException *e) {
-        LOG(@"drawInMTKView exception: %@", e);
+        // --- Manual scan button (optional, keep for fallback) ---
+        // We removed it to avoid clutter, but can keep if needed.
+
+        // --- ESP Drawing ---
+        ImDrawList* drawList = ImGui::GetForegroundDrawList();
+        float viewWidth = view.bounds.size.width;
+        float viewHeight = view.bounds.size.height;
+
+        float viewMat[16] = {0}, projMat[16] = {0};
+        bool w2sReady = false;
+        if (g_CameraManager) {
+            w2sReady = GetViewProjectionMatrices(g_CameraManager, viewMat, projMat);
+        }
+
+        if (g_ActorArray && g_ActorCount > 0 && g_Controller && w2sReady) {
+            for (int i = 0; i < g_ActorCount; i++) {
+                uintptr_t actor = ReadMemory<uintptr_t>(g_ActorArray + (i * sizeof(uintptr_t)));
+                if (!actor) continue;
+                uintptr_t rootOffsets[] = {0x140, 0x130, 0x138, 0x148, 0x180};
+                uintptr_t rootComp = 0;
+                for (int r = 0; r < 5; r++) {
+                    rootComp = ReadMemory<uintptr_t>(actor + rootOffsets[r]);
+                    if (rootComp > 0x10000000 && IsValidVTable(rootComp)) break;
+                }
+                if (!rootComp) continue;
+                Vector3 actorPos = ReadMemory<Vector3>(rootComp + 0x120);
+                if (actorPos.X == 0 && actorPos.Y == 0 && actorPos.Z == 0) continue;
+                Vector3 headPos = actorPos; headPos.Z += 80.0f;
+                Vector3 feetPos = actorPos; feetPos.Z -= 80.0f;
+                Vector2 screenHead, screenFeet, screenPos;
+                if (ProjectWorldToScreen(headPos, screenHead, viewMat, projMat, viewWidth, viewHeight) &&
+                    ProjectWorldToScreen(feetPos, screenFeet, viewMat, projMat, viewWidth, viewHeight) &&
+                    ProjectWorldToScreen(actorPos, screenPos, viewMat, projMat, viewWidth, viewHeight)) {
+                    float boxHeight = fabsf(screenFeet.Y - screenHead.Y);
+                    float boxWidth = boxHeight / 2.0f;
+                    float boxLeft = screenHead.X - (boxWidth / 2.0f);
+                    if (show_ESPLine) {
+                        drawList->AddLine(ImVec2(viewWidth/2, 60), ImVec2(screenHead.X, screenHead.Y), IM_COL32(255,235,59,255), 1.5f);
+                    }
+                    if (show_ESPBox) {
+                        drawList->AddRect(ImVec2(boxLeft, screenHead.Y), ImVec2(boxLeft+boxWidth, screenFeet.Y), IM_COL32(255,40,40,255), 0.0f, 0, 1.6f);
+                    }
+                    if (show_ESPDistance) {
+                        float dist = sqrtf(actorPos.X*actorPos.X + actorPos.Y*actorPos.Y + actorPos.Z*actorPos.Z) / 100.0f;
+                        char txt[32]; snprintf(txt, sizeof(txt), "%.1fm", dist);
+                        drawList->AddText(ImVec2(screenHead.X-10, screenHead.Y-20), IM_COL32(255,255,255,255), txt);
+                    }
+                }
+            }
+        }
+
+        // --- Diagnostics Overlay ---
+        if (show_Diagnostics) {
+            char debugText[1024];
+            snprintf(debugText, sizeof(debugText),
+                     "[Engine Inspector]\n"
+                     "Base: 0x%lx\n"
+                     "GWorld: 0x%lx\n"
+                     "GNames: 0x%lx\n"
+                     "GUObject: 0x%lx\n"
+                     "World: 0x%lx\n"
+                     "Controller: 0x%lx\n"
+                     "CamMgr: 0x%lx\n"
+                     "ActorArr: 0x%lx\n"
+                     "ActorCount: %d\n"
+                     "ViewMatOff: 0x%X\n"
+                     "ProjMatOff: 0x%X\n"
+                     "--- Scan Result ---\n%s",
+                     g_BaseAddress,
+                     g_GWorld, g_GNames, g_GUObjectArray,
+                     g_World, g_Controller, g_CameraManager,
+                     g_ActorArray, g_ActorCount,
+                     g_ViewMatOff, g_ProjMatOff,
+                     scanResult);
+            drawList->AddRectFilled(ImVec2(20,40), ImVec2(380, 320), IM_COL32(10,15,25,210), 6.0f);
+            drawList->AddRect(ImVec2(20,40), ImVec2(380, 320), IM_COL32(0,255,200,180), 6.0f);
+            drawList->AddText(ImVec2(28,46), IM_COL32(255,255,255,255), debugText);
+        }
+
+        // --- Render ImGui ---
+        ImGui::Render();
+        ImDrawData* draw_data = ImGui::GetDrawData();
+        ImGui_ImplMetal_RenderDrawData(draw_data, commandBuffer, renderEncoder);
+
+        [renderEncoder popDebugGroup];
+        [renderEncoder endEncoding];
+        [commandBuffer presentDrawable:view.currentDrawable];
     }
+
+    [commandBuffer commit];
 }
 
 - (void)mtkView:(MTKView*)view drawableSizeWillChange:(CGSize)size {}
@@ -557,16 +535,14 @@ void _huy(void *instance) { huy(instance); }
 
 __attribute__((constructor))
 static void initialize() {
-    // Wait longer to ensure game is fully loaded
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         g_BaseAddress = (uintptr_t)_dyld_get_image_header(0);
-        LOG(@"Base address set to 0x%lx", g_BaseAddress);
     });
 }
 
 __attribute__((constructor))
 static void loadMenu() {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         UIWindow *window = nil;
         if (@available(iOS 13.0, *)) {
             for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
@@ -580,16 +556,13 @@ static void loadMenu() {
                 }
             }
         } else {
-            window = [[UIApplication sharedApplication] keyWindow];
+            window = [[UIApplication sharedApplication] keyWindow]; // deprecated but fine
         }
         if (window) {
             ImGuiDrawView *vc = [[ImGuiDrawView alloc] init];
             [window addSubview:vc.view];
             [window.rootViewController addChildViewController:vc];
             [ImGuiDrawView showChange:YES];
-            LOG(@"Menu loaded successfully");
-        } else {
-            LOG(@"No window found");
         }
     });
 }
