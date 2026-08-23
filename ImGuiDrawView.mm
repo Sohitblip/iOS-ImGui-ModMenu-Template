@@ -251,6 +251,7 @@ static bool show_ESPDistance = true;
 static bool show_Diagnostics = true;
 static bool autoScanDone = false;
 static char scanResult[1024] = "Auto‑scan will start shortly...";
+static CGRect g_ImGuiWindowRect = CGRectZero;
 
 // ---- Logging helper ----
 static void LogOffsetsToFile() {
@@ -280,8 +281,11 @@ static void LogOffsetsToFile() {
     if (!MenDeal) {
         return NO;
     }
-    ImGuiIO& io = ImGui::GetIO();
-    return io.WantCaptureMouse;
+    // Agar click actual menu box ke andar hai, tabhi view touch capture kare
+    if (CGRectContainsPoint(g_ImGuiWindowRect, point)) {
+        return YES;
+    }
+    return NO;
 }
 @end
 
@@ -420,6 +424,12 @@ void _huy(void *instance) { huy(instance); }
         // --- Menu ---
         if (MenDeal) {
             ImGui::Begin("URP Overlay", &MenDeal);
+            
+            // Hit-testing frame update
+            ImVec2 winPos = ImGui::GetWindowPos();
+            ImVec2 winSize = ImGui::GetWindowSize();
+            g_ImGuiWindowRect = CGRectMake(winPos.x, winPos.y, winSize.x, winSize.y);
+            
             ImGui::Text("Overlay Framework Active");
             ImGui::Separator();
             ImGui::Checkbox("Player 2D Box", &show_ESPBox);
@@ -429,6 +439,8 @@ void _huy(void *instance) { huy(instance); }
             ImGui::Separator();
             ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
             ImGui::End();
+        } else {
+            g_ImGuiWindowRect = CGRectZero;
         }
 
         // --- ESP Drawing ---
