@@ -48,10 +48,30 @@ static _ProjectWorldLocationToScreen ProjectWorldLocationToScreen = nullptr;
 static _GetBonePos GetBonePos = nullptr;
 static uintptr_t g_BaseAddress = 0;
 
+// Structure to store Inspector results
+struct EngineDiagnostics {
+    uintptr_t detectedGWorld;
+    uintptr_t detectedGameInstance;
+    uintptr_t matchedGIOffset;
+    uintptr_t detectedLocalPlayer;
+    uintptr_t matchedLPOffset;
+    uintptr_t detectedController;
+    uintptr_t matchedPCOffset;
+    uintptr_t detectedLevel;
+    uintptr_t matchedLevelOffset;
+    uintptr_t detectedActorArray;
+    uintptr_t matchedArrayOffset;
+    int detectedActorCount;
+    int renderedActors;
+    bool w2sFunctionLoaded;
+};
+
+static EngineDiagnostics g_Diag = {0};
+
 // Safe Memory Reader
 template <typename T>
 static inline T ReadMemory(uintptr_t address, T defaultValue = T()) {
-    if (!address || address < 0x10000000) return defaultValue;
+    if (!address || address < 0x10000000 || address > 0x3000000000) return defaultValue;
     T buffer;
     vm_size_t size = 0;
     kern_return_t kr = vm_read_overwrite(mach_task_self(), (vm_address_t)address, sizeof(T), (vm_address_t)&buffer, &size);
@@ -61,56 +81,12 @@ static inline T ReadMemory(uintptr_t address, T defaultValue = T()) {
     return defaultValue;
 }
 
-// Complete Guest ID Reset Routine
-static void ResetPUBGGuestAccount() {
-    NSFileManager *fileManager = [NSFileManager defaultManager];
-    
-    NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    NSString *libPath = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject];
-    
-    NSArray *pathsToDelete = @[
-        [docPath stringByAppendingPathComponent:@"ShadowTrackerExtra/Saved/SaveGames"],
-        [docPath stringByAppendingPathComponent:@"ShadowTrackerExtra/Saved/Paks/puffer_temp"],
-        [docPath stringByAppendingPathComponent:@"ShadowTrackerExtra/Saved/StatEventReportedFlag"],
-        [docPath stringByAppendingPathComponent:@"ShadowTrackerExtra/Saved/Logs"],
-        [docPath stringByAppendingPathComponent:@"ShadowTrackerExtra/Saved/GameErrorNoRecords.txt"],
-        [libPath stringByAppendingPathComponent:@"Caches"],
-        [libPath stringByAppendingPathComponent:@"Preferences"]
-    ];
-    
-    for (NSString *path in pathsToDelete) {
-        if ([fileManager fileExistsAtPath:path]) {
-            NSError *error = nil;
-            [fileManager removeItemAtPath:path error:&error];
-        }
-    }
-    
-    // Clear NSUserDefaults
-    NSString *appDomain = [[NSBundle mainBundle] bundleIdentifier];
-    [[NSUserDefaults standardUserDefaults] removePersistentDomainForName:appDomain];
-    [[NSUserDefaults standardUserDefaults] synchronize];
-    
-    // Clear Keychain Items
-    NSArray *secClasses = @[
-        (__bridge id)kSecClassGenericPassword,
-        (__bridge id)kSecClassInternetPassword,
-        (__bridge id)kSecClassCertificate,
-        (__bridge id)kSecClassKey,
-        (__bridge id)kSecClassIdentity
-    ];
-    
-    for (id secClass in secClasses) {
-        NSDictionary *spec = @{(__bridge id)kSecClass: secClass};
-        SecItemDelete((__bridge CFDictionaryRef)spec);
-    }
-}
-
 // Bools for menu switches
 static bool MenDeal = true;
 static bool show_ESPBox = true;
 static bool show_ESPLine = true;
 static bool show_ESPDistance = true;
-static bool show_DebugMonitor = true;
+static bool show_Diagnostics = true;
 
 @interface ImGuiDrawView () <MTKViewDelegate>
 @property (nonatomic, strong) id <MTLDevice> device;
@@ -222,164 +198,186 @@ void _huy(void *instance) {
         CGFloat y = (([UIApplication sharedApplication].windows[0].rootViewController.view.frame.size.height) - 300) / 2;
         
         ImGui::SetNextWindowPos(ImVec2(x, y), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(360, 290), ImGuiCond_FirstUseEver); 
+        ImGui::SetNextWindowSize(ImVec2(360, 270), ImGuiCond_FirstUseEver); 
         
         // ------------------ ImGui Mod Menu ------------------
         if (MenDeal) 
         {     
-            ImGui::Begin("PUBG GL 4.5 Overlay", &MenDeal);
-                ImGui::Text("Engine Status: Active");
+            ImGui::Begin("PUBG GL Overlay", &MenDeal);
+                ImGui::Text("Overlay Framework Active");
                 ImGui::Separator();
                 
                 ImGui::Checkbox("Player 2D Box", &show_ESPBox);
                 ImGui::Checkbox("Player Snaplines", &show_ESPLine);
                 ImGui::Checkbox("Player Distance", &show_ESPDistance);
-                ImGui::Checkbox("Debug Telemetry", &show_DebugMonitor);
-                
-                ImGui::Separator();
-                
-                // Guest Reset Button with Auto-Restart
-                if (ImGui::Button("Reset Guest ID (Clean & Exit)", ImVec2(-1, 28))) {
-                    ResetPUBGGuestAccount();
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                        exit(0);
-                    });
-                }
+                ImGui::Checkbox("Show Offset Inspector", &show_Diagnostics);
                 
                 ImGui::Separator();
                 ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
             ImGui::End();   
         }
         
-        // ------------------ Dynamic ESP Engine ------------------
-        ImDrawList* drawList = ImGui::GetForegroundDrawList();
-
-        uintptr_t gWorldPtr = 0;
-        void* playerController = nullptr;
-        uintptr_t persistentLevel = 0;
-        uintptr_t actorArrayAddr = 0;
-        int actorCount = 0;
-        int validActorsFound = 0;
+        // ------------------ Diagnostics & Engine Scanning ------------------
+        memset(&g_Diag, 0, sizeof(EngineDiagnostics));
+        g_Diag.w2sFunctionLoaded = (ProjectWorldLocationToScreen != nullptr);
 
         if (g_BaseAddress) {
-            gWorldPtr = ReadMemory<uintptr_t>(g_BaseAddress + OFF_UWorld);
-            if (!gWorldPtr) {
-                gWorldPtr = ReadMemory<uintptr_t>(g_BaseAddress + OFF_GWorld_Data);
+            // 1. Check GWorld Candidates
+            uintptr_t gWorldCandidates[] = {
+                ReadMemory<uintptr_t>(g_BaseAddress + OFF_UWorld),
+                ReadMemory<uintptr_t>(g_BaseAddress + OFF_GWorld_Data)
+            };
+
+            for (int i = 0; i < 2; i++) {
+                if (gWorldCandidates[i] > 0x10000000) {
+                    g_Diag.detectedGWorld = gWorldCandidates[i];
+                    break;
+                }
             }
 
-            if (gWorldPtr) {
-                // Multi-Path Controller Scanner
-                uintptr_t gameInstanceOffsets[] = {0x24, 0x90, 0x88, 0x38, 0x140};
+            if (g_Diag.detectedGWorld) {
+                // 2. Scan GameInstance & LocalPlayer
+                uintptr_t giOffsets[] = {0x24, 0x88, 0x90, 0x38, 0x140};
                 for (int gi = 0; gi < 5; gi++) {
-                    uintptr_t gameInstance = ReadMemory<uintptr_t>(gWorldPtr + gameInstanceOffsets[gi]);
-                    if (!gameInstance) continue;
+                    uintptr_t giCandidate = ReadMemory<uintptr_t>(g_Diag.detectedGWorld + giOffsets[gi]);
+                    if (giCandidate > 0x10000000) {
+                        g_Diag.detectedGameInstance = giCandidate;
+                        g_Diag.matchedGIOffset = giOffsets[gi];
 
-                    uintptr_t localPlayersOffsets[] = {0x38, 0x40, 0x30, 0x98};
-                    for (int lp = 0; lp < 4; lp++) {
-                        uintptr_t localPlayers = ReadMemory<uintptr_t>(gameInstance + localPlayersOffsets[lp]);
-                        if (!localPlayers) continue;
+                        uintptr_t lpOffsets[] = {0x38, 0x40, 0x30, 0x98};
+                        for (int lp = 0; lp < 4; lp++) {
+                            uintptr_t lpArray = ReadMemory<uintptr_t>(giCandidate + lpOffsets[lp]);
+                            uintptr_t lpCandidate = ReadMemory<uintptr_t>(lpArray);
+                            if (lpCandidate > 0x10000000) {
+                                g_Diag.detectedLocalPlayer = lpCandidate;
+                                g_Diag.matchedLPOffset = lpOffsets[lp];
 
-                        uintptr_t localPlayer = ReadMemory<uintptr_t>(localPlayers);
-                        if (!localPlayer) continue;
-
-                        uintptr_t pcOffsets[] = {0x30, 0x28, 0x20, 0x38};
-                        for (int pci = 0; pci < 4; pci++) {
-                            void* pcCandidate = (void*)ReadMemory<uintptr_t>(localPlayer + pcOffsets[pci]);
-                            if (pcCandidate && (uintptr_t)pcCandidate > 0x10000000) {
-                                playerController = pcCandidate;
+                                uintptr_t pcOffsets[] = {0x30, 0x28, 0x20, 0x38};
+                                for (int pc = 0; pc < 4; pc++) {
+                                    uintptr_t pcCandidate = ReadMemory<uintptr_t>(lpCandidate + pcOffsets[pc]);
+                                    if (pcCandidate > 0x10000000) {
+                                        g_Diag.detectedController = pcCandidate;
+                                        g_Diag.matchedPCOffset = pcOffsets[pc];
+                                        break;
+                                    }
+                                }
                                 break;
                             }
                         }
-                        if (playerController) break;
+                        break;
                     }
-                    if (playerController) break;
                 }
 
-                // Level & Actor Array Scanner
-                uintptr_t levelOffsets[] = {0x30, 0x20, 0x90, 0x98, 0x138};
+                // 3. Scan PersistentLevel & ActorArray
+                uintptr_t lvlOffsets[] = {0x30, 0x20, 0x90, 0x98, 0x138};
                 for (int li = 0; li < 5; li++) {
-                    uintptr_t lvlCandidate = ReadMemory<uintptr_t>(gWorldPtr + levelOffsets[li]);
-                    if (lvlCandidate && lvlCandidate > 0x10000000) {
+                    uintptr_t lvlCandidate = ReadMemory<uintptr_t>(g_Diag.detectedGWorld + lvlOffsets[li]);
+                    if (lvlCandidate > 0x10000000) {
                         uintptr_t arrOffsets[] = {0x98, 0xA0, 0xA8, 0x70};
                         for (int ai = 0; ai < 4; ai++) {
                             uintptr_t arr = ReadMemory<uintptr_t>(lvlCandidate + arrOffsets[ai]);
                             int cnt = ReadMemory<int>(lvlCandidate + arrOffsets[ai] + 0x8);
-                            if (arr && cnt > 0 && cnt < 2048) {
-                                persistentLevel = lvlCandidate;
-                                actorArrayAddr = arr;
-                                actorCount = cnt;
+                            if (arr > 0x10000000 && cnt > 0 && cnt < 2048) {
+                                g_Diag.detectedLevel = lvlCandidate;
+                                g_Diag.matchedLevelOffset = lvlOffsets[li];
+                                g_Diag.detectedActorArray = arr;
+                                g_Diag.matchedArrayOffset = arrOffsets[ai];
+                                g_Diag.detectedActorCount = cnt;
                                 break;
                             }
                         }
-                        if (actorArrayAddr) break;
-                    }
-                }
-
-                // Render Live ESP
-                if (actorCount > 0 && actorArrayAddr && playerController && ProjectWorldLocationToScreen) {
-                    for (int i = 0; i < actorCount; i++) {
-                        uintptr_t actor = ReadMemory<uintptr_t>(actorArrayAddr + (i * sizeof(uintptr_t)));
-                        if (!actor) continue;
-
-                        uintptr_t rootOffsets[] = {0x140, 0x130, 0x138, 0x148, 0x180};
-                        uintptr_t rootComp = 0;
-                        for (int r = 0; r < 5; r++) {
-                            rootComp = ReadMemory<uintptr_t>(actor + rootOffsets[r]);
-                            if (rootComp && rootComp > 0x10000000) break;
-                        }
-                        if (!rootComp) continue;
-
-                        Vector3 actorPos = ReadMemory<Vector3>(rootComp + 0x120);
-                        if (actorPos.X == 0 && actorPos.Y == 0 && actorPos.Z == 0) {
-                            actorPos = ReadMemory<Vector3>(rootComp + 0x11C);
-                        }
-                        if (actorPos.X == 0 && actorPos.Y == 0 && actorPos.Z == 0) continue;
-
-                        Vector3 headPos = actorPos; headPos.Z += 80.0f;
-                        Vector3 feetPos = actorPos; feetPos.Z -= 80.0f;
-
-                        Vector2 screenHead, screenFeet, screenPos;
-
-                        if (ProjectWorldLocationToScreen(playerController, headPos, screenHead, false) &&
-                            ProjectWorldLocationToScreen(playerController, feetPos, screenFeet, false) &&
-                            ProjectWorldLocationToScreen(playerController, actorPos, screenPos, false)) {
-
-                            validActorsFound++;
-
-                            float boxHeight = fabsf(screenFeet.Y - screenHead.Y);
-                            float boxWidth = boxHeight / 2.0f;
-                            float boxLeft = screenHead.X - (boxWidth / 2.0f);
-                            float boxRight = screenHead.X + (boxWidth / 2.0f);
-
-                            if (show_ESPLine) {
-                                drawList->AddLine(
-                                    ImVec2(view.bounds.size.width / 2.0f, 60.0f),
-                                    ImVec2(screenHead.X, screenHead.Y),
-                                    IM_COL32(255, 235, 59, 255), 1.5f
-                                );
-                            }
-
-                            if (show_ESPBox) {
-                                drawList->AddRect(
-                                    ImVec2(boxLeft, screenHead.Y),
-                                    ImVec2(boxRight, screenFeet.Y),
-                                    IM_COL32(255, 40, 40, 255), 0.0f, 0, 1.6f
-                                );
-                            }
-                        }
+                        if (g_Diag.detectedActorArray) break;
                     }
                 }
             }
         }
 
-        // ------------------ Telemetry Monitor ------------------
-        if (show_DebugMonitor) {
-            char debugText[256];
-            snprintf(debugText, sizeof(debugText), 
-                     "PUBG Telemetry\nBase: 0x%lx\nGWorld: 0x%lx\nController: %p\nActors in Level: %d\nRendered ESP: %d", 
-                     g_BaseAddress, gWorldPtr, playerController, actorCount, validActorsFound);
-            drawList->AddRectFilled(ImVec2(20, 40), ImVec2(240, 130), IM_COL32(0, 0, 0, 180), 6.0f);
-            drawList->AddText(ImVec2(28, 48), IM_COL32(0, 255, 128, 255), debugText);
+        // ------------------ ESP Drawing ------------------
+        ImDrawList* drawList = ImGui::GetForegroundDrawList();
+
+        if (g_Diag.detectedActorCount > 0 && g_Diag.detectedActorArray && g_Diag.detectedController && ProjectWorldLocationToScreen) {
+            for (int i = 0; i < g_Diag.detectedActorCount; i++) {
+                uintptr_t actor = ReadMemory<uintptr_t>(g_Diag.detectedActorArray + (i * sizeof(uintptr_t)));
+                if (!actor) continue;
+
+                uintptr_t rootOffsets[] = {0x140, 0x130, 0x138, 0x148, 0x180};
+                uintptr_t rootComp = 0;
+                for (int r = 0; r < 5; r++) {
+                    rootComp = ReadMemory<uintptr_t>(actor + rootOffsets[r]);
+                    if (rootComp > 0x10000000) break;
+                }
+                if (!rootComp) continue;
+
+                Vector3 actorPos = ReadMemory<Vector3>(rootComp + 0x120);
+                if (actorPos.X == 0 && actorPos.Y == 0 && actorPos.Z == 0) {
+                    actorPos = ReadMemory<Vector3>(rootComp + 0x11C);
+                }
+                if (actorPos.X == 0 && actorPos.Y == 0 && actorPos.Z == 0) continue;
+
+                Vector3 headPos = actorPos; headPos.Z += 80.0f;
+                Vector3 feetPos = actorPos; feetPos.Z -= 80.0f;
+
+                Vector2 screenHead, screenFeet, screenPos;
+
+                if (ProjectWorldLocationToScreen((void*)g_Diag.detectedController, headPos, screenHead, false) &&
+                    ProjectWorldLocationToScreen((void*)g_Diag.detectedController, feetPos, screenFeet, false) &&
+                    ProjectWorldLocationToScreen((void*)g_Diag.detectedController, actorPos, screenPos, false)) {
+
+                    g_Diag.renderedActors++;
+
+                    float boxHeight = fabsf(screenFeet.Y - screenHead.Y);
+                    float boxWidth = boxHeight / 2.0f;
+                    float boxLeft = screenHead.X - (boxWidth / 2.0f);
+                    float boxRight = screenHead.X + (boxWidth / 2.0f);
+
+                    if (show_ESPLine) {
+                        drawList->AddLine(
+                            ImVec2(view.bounds.size.width / 2.0f, 60.0f),
+                            ImVec2(screenHead.X, screenHead.Y),
+                            IM_COL32(255, 235, 59, 255), 1.5f
+                        );
+                    }
+
+                    if (show_ESPBox) {
+                        drawList->AddRect(
+                            ImVec2(boxLeft, screenHead.Y),
+                            ImVec2(boxRight, screenFeet.Y),
+                            IM_COL32(255, 40, 40, 255), 0.0f, 0, 1.6f
+                        );
+                    }
+                }
+            }
+        }
+
+        // ------------------ On-Screen Diagnostics Inspector ------------------
+        if (show_Diagnostics) {
+            char debugText[512];
+            snprintf(debugText, sizeof(debugText),
+                     "[Engine Inspector]\n"
+                     "BaseAddr: 0x%lx\n"
+                     "W2S Linked: %s\n"
+                     "GWorld: 0x%lx\n"
+                     "GameInstance: 0x%lx (Offset: 0x%lx)\n"
+                     "LocalPlayer: 0x%lx (Offset: 0x%lx)\n"
+                     "Controller: 0x%lx (Offset: 0x%lx)\n"
+                     "Level: 0x%lx (Offset: 0x%lx)\n"
+                     "ActorArray: 0x%lx (Offset: 0x%lx)\n"
+                     "ActorCount: %d\n"
+                     "Rendered ESP: %d",
+                     g_BaseAddress,
+                     g_Diag.w2sFunctionLoaded ? "YES" : "NO",
+                     g_Diag.detectedGWorld,
+                     g_Diag.detectedGameInstance, g_Diag.matchedGIOffset,
+                     g_Diag.detectedLocalPlayer, g_Diag.matchedLPOffset,
+                     g_Diag.detectedController, g_Diag.matchedPCOffset,
+                     g_Diag.detectedLevel, g_Diag.matchedLevelOffset,
+                     g_Diag.detectedActorArray, g_Diag.matchedArrayOffset,
+                     g_Diag.detectedActorCount,
+                     g_Diag.renderedActors);
+
+            drawList->AddRectFilled(ImVec2(20, 40), ImVec2(320, 220), IM_COL32(10, 15, 25, 210), 6.0f);
+            drawList->AddRect(ImVec2(20, 40), ImVec2(320, 220), IM_COL32(0, 255, 200, 180), 6.0f);
+            drawList->AddText(ImVec2(28, 46), IM_COL32(255, 255, 255, 255), debugText);
         }
 
         // ------------------ ImGui Render Pass ------------------
