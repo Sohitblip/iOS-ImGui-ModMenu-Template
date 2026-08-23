@@ -17,17 +17,13 @@ jobs:
           bash -c "$(curl -fsSL https://githubusercontent.com)"
           echo "THEOS=$HOME/theos" >> $GITHUB_ENV
 
-      - name: Compile dylib via Xcode Clang
+      - name: Compile via Native Theos Makefile
         run: |
-          xcrun -sdk iphoneos clang++ -dynamiclib -arch arm64 \
-          -std=c++11 -stdlib=libc++ \
-          -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
-          -framework UIKit -framework Foundation -framework CoreGraphics -framework Metal -framework MetalKit \
-          -I./IMGUI -I./Esp -I./5Toubun \
-          ImGuiDrawView.mm -o libPUBGOverlay.dylib
+          export THEOS=$HOME/theos
+          make THEOS_PACKAGE_SCHEME=rootless ARCHS="arm64" FINALPACKAGE=1
 
       - name: Upload Compiled Binary Artifact
         uses: actions/upload-artifact@v4
         with:
           name: Compiled-PUBG-Dylib
-          path: libPUBGOverlay.dylib
+          path: .theos/obj/debug/*.dylib
