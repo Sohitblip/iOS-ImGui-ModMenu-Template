@@ -1,29 +1,55 @@
-name: Compile iOS Overlay Dylib
+name: Build iOS ImGui Dylib
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
   workflow_dispatch:
 
 jobs:
   build_library:
     runs-on: macos-14
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      - name: Set Xcode Version
+        run: |
+          sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
+
       - name: Compile Standalone Dylib via Clang
         run: |
-          xcrun -sdk iphoneos clang++ -dynamiclib -arch arm64 \
-          -std=c++11 -stdlib=libc++ \
-          -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
-          -Dtheos_tweaks_compat=1 -DSO_NOSIGPIPE=1 -D__HE_HEADER_PASSTHROUGH__=1 \
-          -framework UIKit -framework Foundation -framework CoreGraphics -framework Metal -framework MetalKit \
-          -I./Esp -I./5Toubun \
-          ImGuiDrawView.mm IMGUI/*.cpp -o libPUBGOverlay.dylib
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+
+          # Objective-C++ Metal + ImGui Clang Build
+          clang++ -target arm64-apple-ios14.0 -dynamiclib \
+            -isysroot "$SDK_PATH" \
+            -fobjc-arc \
+            -O2 \
+            -std=c++17 \
+            -framework Metal \
+            -framework MetalKit \
+            -framework UIKit \
+            -framework Foundation \
+            -framework CoreGraphics \
+            -framework QuartzCore \
+            -I. \
+            -I./IMGUI \
+            -I./Esp \
+            -I./5Toubun \
+            ImGuiDrawView.mm \
+            IMGUI/imgui.cpp \
+            IMGUI/imgui_draw.cpp \
+            IMGUI/imgui_demo.cpp \
+            IMGUI/imgui_tables.cpp \
+            IMGUI/imgui_widgets.cpp \
+            IMGUI/imgui_impl_metal.mm \
+            -o libPUBGOverlay.dylib
 
       - name: Upload Compiled Binary Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Compiled-PUBG-Dylib
+          name: libPUBGOverlay-dylib
           path: libPUBGOverlay.dylib
