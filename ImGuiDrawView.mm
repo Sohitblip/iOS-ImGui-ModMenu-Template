@@ -1,13 +1,16 @@
 #import <Metal/Metal.h>
 #import <MetalKit/MetalKit.h>
 #import <Foundation/Foundation.h>
-//Imgui library
+#import <mach-o/dyld.h>
+
+// Imgui library
 #import "Esp/CaptainHook.h"
 #import "Esp/ImGuiDrawView.h"
 #import "IMGUI/imgui.h"
 #import "IMGUI/imgui_impl_metal.h"
 #import "IMGUI/Honkai.h"
-//Patch library
+
+// Patch library
 #import "5Toubun/NakanoIchika.h"
 #import "5Toubun/NakanoNino.h"
 #import "5Toubun/NakanoMiku.h"
@@ -17,25 +20,33 @@
 
 #define kWidth  [UIScreen mainScreen].bounds.size.width
 #define kHeight [UIScreen mainScreen].bounds.size.height
-#define kScale [UIScreen mainScreen].scale
+#define kScale  [UIScreen mainScreen].scale
 
-/*
-    Components:
- 
- - Metal: The code leverages the Metal framework for graphics rendering and GPU acceleration.
- - ImGui: The ImGui library is used to create and manage the graphical elements of the application's user interface.
- - Patch Library: Various patching and hooking functions are employed to modify the behavior of the target application dynamically.
- - Touch Event Handling: The code handles touch events to allow user interactions with the GUI.
- 
- Key Features:
- 
- - The `MenDeal` boolean variable controls whether the menu is open or closed.
- - The GUI elements are drawn using ImGui, offering features like checkboxes and text display.
- - The code includes patching functions to enable or disable specific in-game cheats based on user interactions with the GUI.
- - It utilizes Metal's rendering capabilities to display the GUI on the screen.
- - Touch events are captured and processed to update the GUI's interaction state
-     */
- 
+// --- Vector structures for UE4 coordinates ---
+struct Vector3 { float X; float Y; float Z; };
+struct Vector2 { float X; float Y; };
+
+// --- PUBG GL 4.5 OFFSETS ---
+#define OFF_UWorld              0x10C034388
+#define OFF_BonePos             0x10356B00C
+#define OFF_GWorld_Data         0x10AA11EA0
+#define OFF_GWorld_Fn           0x10219A0F0
+#define OFF_GName_Data          0x10A5BD5F0
+#define OFF_GName_Fn            0x105014128
+#define OFF_GUObject            0x10A7F93E0
+#define OFF_LineOfSight         0x1062126D4
+#define OFF_ActorArray          0x1063693F0
+#define OFF_W2S_Function        0x1062B69B8
+
+// Define the exact Engine function pointer signature for World-to-Screen conversion
+typedef bool (*_ProjectWorldLocationToScreen)(void* PlayerController, Vector3 WorldLocation, Vector2& ScreenLocation, bool bPlayerViewportRelative);
+static _ProjectWorldLocationToScreen ProjectWorldLocationToScreen;
+
+// Bools for menu switches
+static bool MenDeal = true;
+static bool show_ESPBox = false;
+static bool show_ESPLine = false;
+
 @interface ImGuiDrawView () <MTKViewDelegate>
 @property (nonatomic, strong) id <MTLDevice> device;
 @property (nonatomic, strong) id <MTLCommandQueue> commandQueue;
@@ -43,14 +54,11 @@
 
 @implementation ImGuiDrawView
 
-//I usually let the function for hooking in here...
+// Hooking function pointers
 void (*huy)(void *instance);
-void _huy(void *instance)
-{
-huy(instance);
+void _huy(void *instance) {
+    huy(instance);
 }
-
-static bool MenDeal = true;
 
 - (instancetype)initWithNibName:(nullable NSString *)nibNameOrNil bundle:(nullable NSBundle *)nibBundleOrNil
 {
@@ -65,7 +73,7 @@ static bool MenDeal = true;
     ImGui::StyleColorsClassic(); 
     ImFont* font = io.Fonts->AddFontFromMemoryCompressedTTF((void*)Honkai_compressed_data, Honkai_compressed_size, 45.0f, NULL, io.Fonts->GetGlyphRangesDefault());
     ImGui_ImplMetal_Init(_device);
-return self;
+    return self;
 }
 
 + (void)showChange:(BOOL)open
@@ -86,7 +94,7 @@ return self;
 }
 
 - (void)viewDidLoad {
- [super viewDidLoad];
+    [super viewDidLoad];
     self.mtkView.device = self.device;
     self.mtkView.delegate = self;
     self.mtkView.clearColor = MTLClearColorMake(0, 0, 0, 0);
@@ -114,31 +122,15 @@ return self;
     io.MouseDown[0] = hasActiveTouch;
 }
 
-- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event
-{
-    [self updateIOWithTouchEvent:event];
-}
-
-- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event
-{
-    [self updateIOWithTouchEvent:event];
-}
-
-- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event
-{
-    [self updateIOWithTouchEvent:event];
-}
-
-- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event
-{
-    [self updateIOWithTouchEvent:event];
-}
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event { [self updateIOWithTouchEvent:event]; }
+- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event { [self updateIOWithTouchEvent:event]; }
+- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event { [self updateIOWithTouchEvent:event]; }
+- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event { [self updateIOWithTouchEvent:event]; }
 
 #pragma mark - MTKViewDelegate
 
 - (void)drawInMTKView:(MTKView*)view
 {
-    //main function
     ImGuiIO& io = ImGui::GetIO();
     io.DisplaySize.x = view.bounds.size.width;
     io.DisplaySize.y = view.bounds.size.height;
@@ -148,97 +140,58 @@ return self;
     io.DeltaTime = 1 / float(view.preferredFramesPerSecond ?: 120);
     
     id<MTLCommandBuffer> commandBuffer = [self.commandQueue commandBuffer];
-    
-    //Define your bool/function in here for local scope... can also use objc class and set a @property in the class if extending the cheat for larger complex tasks
-    static bool show_s0 = false;    
-    static bool show_s1 = false;    
-    static bool show_s2 = false;    
-    static bool show_s3 = false;    
-    static bool show_s4 = false;    
-    static bool show_s5 = false;    
-    static bool show_s6 = false;                    
-    static bool show_s7 = false;        
-    static bool show_s8 = false;      
-    static bool show_s9 = false;     
-    static bool show_s10 = false;     
-    static bool show_s11 = false;     
-    static bool show_s12 = false;     
-
-    //Define active function
-    static bool show_s0_active = false;
-        
     [self.view setUserInteractionEnabled:(MenDeal ? YES : NO)];
 
-        MTLRenderPassDescriptor* renderPassDescriptor = view.currentRenderPassDescriptor;
-        if (renderPassDescriptor != nil)
-        {
-            //imgui setup 
-            id <MTLRenderCommandEncoder> renderEncoder = [commandBuffer renderCommandEncoderWithDescriptor:renderPassDescriptor];
-            [renderEncoder pushDebugGroup:@"ImGui Jane"];
+    MTLRenderPassDescriptor* renderPassDescriptor = view.currentRenderPassDescriptor;
+    if (renderPassDescriptor != nil)
+    {
+        id <MTLRenderCommandEncoder> renderEncoder = [commandBuffer renderCommandEncoderWithDescriptor:renderPassDescriptor];
+        [renderEncoder pushDebugGroup:@"ImGui Jane"];
 
-            ImGui_ImplMetal_NewFrame(renderPassDescriptor);
-            ImGui::NewFrame();
-            
-            ImFont* font = ImGui::GetFont();
-            font->Scale = 15.f / font->FontSize;
-            
-            CGFloat x = (([UIApplication sharedApplication].windows[0].rootViewController.view.frame.size.width) - 360) / 2;
-            CGFloat y = (([UIApplication sharedApplication].windows[0].rootViewController.view.frame.size.height) - 300) / 2;
-            
-            ImGui::SetNextWindowPos(ImVec2(x, y), ImGuiCond_FirstUseEver);
-            ImGui::SetNextWindowSize(ImVec2(400, 300), ImGuiCond_FirstUseEver); 
-            
-            if (MenDeal == true)
-            {     
-            // IMGUI design from begin to end, entitely inside this condition
-              ImGui::Begin("Little 34306 JIT Menu!", &MenDeal);
-                ImGui::Text("Use 3 Fingers Click 3 Times Open Menu\n2 Finger Tap Screen 2 Times Hide Menu\n\nOpen In Lobby");
-                ImGui::TableNextColumn();
-                ImGui::Checkbox("Map Cheat Enable", &show_s0);
-                ImGui::Text("Contact me on Telegram: @little34306 (%.3f ms/frame (%.1f FPS))\nThis menu support Xina, Dopamine, unc0ver, palera1n\nand Non-jailbreak too!", 500.0f / ImGui::GetIO().Framerate, ImGui::GetIO().Framerate);
-              ImGui::End();   
-            }
-            
-        ImDrawList* draw_list = ImGui::GetBackgroundDrawList();
+        ImGui_ImplMetal_NewFrame(renderPassDescriptor);
+        ImGui::NewFrame();
         
-//START MAIN CHEAT CODE HERE -----------------------------------------------------
-    //Using the imgui menu bools to trigger our hex byte patching cheat function
-    if(show_s0){
-        if(show_s0_active == NO){
-            vm_unity(ENCRYPTOFFSET("0x517A154"), strtoul(ENCRYPTHEX("0x360080D2"), nullptr, 0));
-            vm(ENCRYPTOFFSET("0x10517A154"), strtoul(ENCRYPTHEX("0x360080D2"), nullptr, 0));
-            }
-        show_s0_active = YES;
-    } else {
-        if(show_s0_active == YES){
-            vm_unity(ENCRYPTOFFSET("0x517A154"), strtoul(ENCRYPTHEX("0xF60302AA"), nullptr, 0));
-            vm(ENCRYPTOFFSET("0x10517A154"), strtoul(ENCRYPTHEX("0xF60302AA"), nullptr, 0));
-            }
-        show_s0_active = NO;
-    }
+        ImFont* font = ImGui::GetFont();
+        font->Scale = 15.f / font->FontSize;
         
-    //Hooking a function constructor
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-          //use DobbyHook, same use as MSHookFunction but working on JIT, Dopamine!
-          DobbyHook((void *)(getRealOffset(ENCRYPTOFFSET("0x5F145F8"))), (void *)_huy, (void **)&huy);
-    });
-
-
-//END CHEAT LOGIC
-
-            //------------------ call imgui render to draw menu and other 'shaders'
-            ImGui::Render();
-            ImDrawData* draw_data = ImGui::GetDrawData();
-            ImGui_ImplMetal_RenderDrawData(draw_data, commandBuffer, renderEncoder);
-          
-            [renderEncoder popDebugGroup];
-            [renderEncoder endEncoding];
-
-            [commandBuffer presentDrawable:view.currentDrawable];
+        CGFloat x = (([UIApplication sharedApplication].windows[0].rootViewController.view.frame.size.width) - 360) / 2;
+        CGFloat y = (([UIApplication sharedApplication].windows[0].rootViewController.view.frame.size.height) - 300) / 2;
+        
+        ImGui::SetNextWindowPos(ImVec2(x, y), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(400, 300), ImGuiCond_FirstUseEver); 
+        
+        if (MenDeal)
+        { 
+            ImGui::Begin("Little 34306 JIT Menu!", &MenDeal);
+            ImGui::Text("ESP Switches:");
+            ImGui::Checkbox("ESP Box", &show_ESPBox);
+            ImGui::Checkbox("ESP Line", &show_ESPLine);
+            ImGui::Separator();
+            ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
+            ImGui::End();   
         }
+        
+        ImDrawList* draw_list = ImGui::GetBackgroundDrawList();
 
-        [commandBuffer commit];
+        // Runtime hook initialization for W2S & functions
+        static dispatch_once_t onceToken;
+        dispatch_once(&onceToken, ^{
+            ProjectWorldLocationToScreen = (_ProjectWorldLocationToScreen)getRealOffset(ENCRYPTOFFSET("0x1062B69B8"));
+            DobbyHook((void *)(getRealOffset(ENCRYPTOFFSET("0x5F145F8"))), (void *)_huy, (void **)&huy);
+        });
+
+        // ------------------ ImGui Render Pass ------------------
+        ImGui::Render();
+        ImDrawData* draw_data = ImGui::GetDrawData();
+        ImGui_ImplMetal_RenderDrawData(draw_data, commandBuffer, renderEncoder);
+      
+        [renderEncoder popDebugGroup];
+        [renderEncoder endEncoding];
+
+        [commandBuffer presentDrawable:view.currentDrawable];
+    }
+
+    [commandBuffer commit];
 }
 
 - (void)mtkView:(MTKView*)view drawableSizeWillChange:(CGSize)size
@@ -247,4 +200,3 @@ return self;
 }
 
 @end
-
