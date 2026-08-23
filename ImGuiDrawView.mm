@@ -44,10 +44,6 @@ static int g_ActorCount = 0;
 static int g_ViewMatOff = 0x30;
 static int g_ProjMatOff = 0x70;
 
-// --- Store ImGui window rect for hit‑testing ---
-static ImVec2 g_MenuWindowPos = ImVec2(0,0);
-static ImVec2 g_MenuWindowSize = ImVec2(0,0);
-
 // --- Safe Memory Reader ---
 template <typename T>
 static inline T ReadMemory(uintptr_t address, T defaultValue = T()) {
@@ -68,7 +64,7 @@ static bool IsValidVTable(uintptr_t obj) {
 }
 
 // --------------------------------------------------------------------
-// Matrix detection functions (MUST be defined before ScanOffsets)
+// Matrix detection functions
 // --------------------------------------------------------------------
 struct FMinimalViewInfo {
     Vector3 Location;
@@ -117,11 +113,10 @@ static uintptr_t FindGNames() {
         vm_size_t size = 0;
         if (vm_read_overwrite(mach_task_self(), (vm_address_t)addr, len, (vm_address_t)buf, &size) == KERN_SUCCESS && size == len) {
             if (strncmp(buf, pattern, len) == 0) {
-                // Found "None" – now scan for a pointer to this address
                 for (uintptr_t p = g_BaseAddress; p < g_BaseAddress + 0x1000000; p += 4) {
                     uintptr_t ptr = ReadMemory<uintptr_t>(p);
                     if (ptr == addr) {
-                        return p; // pointer location (offset)
+                        return p;
                     }
                 }
                 break;
@@ -135,7 +130,7 @@ static uintptr_t FindGNames() {
 static void ScanOffsets() {
     if (!g_BaseAddress) return;
 
-    // 1. Find GWorld via heuristic scanning
+    // 1. Find GWorld
     for (int off = 0; off < 0x1000; off += 4) {
         uintptr_t ptr = ReadMemory<uintptr_t>(g_BaseAddress + off);
         if (ptr > 0x10000000 && ptr < 0x3000000000) {
@@ -154,7 +149,6 @@ static void ScanOffsets() {
     }
 
     if (g_GWorld) {
-        // Find GameInstance (try common offsets)
         for (int off = 0x20; off < 0x100; off += 4) {
             uintptr_t gi = ReadMemory<uintptr_t>(g_GWorld + off);
             if (gi > 0x10000000 && IsValidVTable(gi)) {
@@ -162,7 +156,6 @@ static void ScanOffsets() {
                 if (lpArray > 0x10000000) {
                     uintptr_t lp = ReadMemory<uintptr_t>(lpArray);
                     if (lp > 0x10000000 && IsValidVTable(lp)) {
-                        // LocalPlayer found
                         for (int pcOff = 0x20; pcOff < 0x80; pcOff += 4) {
                             uintptr_t pc = ReadMemory<uintptr_t>(lp + pcOff);
                             if (pc > 0x10000000 && IsValidVTable(pc)) {
@@ -180,7 +173,6 @@ static void ScanOffsets() {
             }
         }
 
-        // Find PersistentLevel and ActorArray
         for (int off = 0x20; off < 0x100; off += 4) {
             uintptr_t level = ReadMemory<uintptr_t>(g_GWorld + off);
             if (level > 0x10000000 && IsValidVTable(level)) {
@@ -195,12 +187,10 @@ static void ScanOffsets() {
         }
     }
 
-    // 2. Find GNames (using pattern scan)
     if (!g_GNames) {
         g_GNames = FindGNames();
     }
 
-    // 3. Find GUObjectArray (scan for pointer to an array of UObjects)
     if (!g_GUObjectArray) {
         for (int off = 0; off < 0x1000000; off += 4) {
             uintptr_t ptr = ReadMemory<uintptr_t>(g_BaseAddress + off);
@@ -217,7 +207,6 @@ static void ScanOffsets() {
         }
     }
 
-    // 4. Auto‑detect matrix offsets
     if (g_CameraManager) {
         int vOff, pOff;
         if (DetectMatrixOffsets(g_CameraManager, vOff, pOff)) {
@@ -262,10 +251,28 @@ static bool show_ESPBox = true;
 static bool show_ESPLine = true;
 static bool show_ESPDistance = true;
 static bool show_Diagnostics = true;
-static bool scanRequested = false;
-static char scanResult[1024] = "Auto‑scan will start shortly...";
 static bool autoScanDone = false;
-static dispatch_source_t scanTimer = nil;
+static char scanResult[1024] = "Auto‑scan will start shortly...";
+
+// ---- Logging helper (optional) ----
+static void LogOffsetsToFile() {
+    @autoreleasepool {
+        NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+        NSString *docDir = [paths firstObject];
+        NSString *filePath = [docDir stringByAppendingPathComponent:@"offset_log.txt"];
+        NSString *log = [NSString stringWithFormat:
+            @"========= URP OFFSET LOG =========\n"
+            @"Timestamp: %@\n"
+            @"Base: 0x%lx\nGWorld: 0x%lx\nGNames: 0x%lx\nGUObject: 0x%lx\n"
+            @"World: 0x%lx\nController: 0x%lx\nCamMgr: 0x%lx\n"
+            @"ActorArr: 0x%lx\nActorCount: %d\nViewMatOff: 0x%X\nProjMatOff: 0x%X\n\n",
+            [NSDate date], g_BaseAddress, g_GWorld, g_GNames, g_GUObjectArray,
+            g_World, g_Controller, g_CameraManager,
+            g_ActorArray, g_ActorCount, g_ViewMatOff, g_ProjMatOff];
+        [log writeToFile:filePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        NSLog(@"Log saved to: %@", filePath);
+    }
+}
 
 // ---- ImGuiDrawView ----
 @interface ImGuiDrawView () <MTKViewDelegate>
@@ -310,14 +317,14 @@ void _huy(void *instance) { huy(instance); }
     self.mtkView.clearColor = MTLClearColorMake(0, 0, 0, 0);
     self.mtkView.backgroundColor = [UIColor colorWithRed:0 green:0 blue:0 alpha:0];
     self.mtkView.clipsToBounds = YES;
+    // Touch will be toggled in draw loop
     self.view.userInteractionEnabled = YES;
     
-    // --- Auto‑scan after 6 seconds ---
+    // Auto-scan after 6 seconds
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if (!autoScanDone) {
             ScanOffsets();
             autoScanDone = YES;
-            // Update scan result string
             snprintf(scanResult, sizeof(scanResult),
                      "GWorld: 0x%lx\nGNames: 0x%lx\nGUObjectArray: 0x%lx\n"
                      "World: 0x%lx\nController: 0x%lx\nCameraManager: 0x%lx\n"
@@ -325,10 +332,10 @@ void _huy(void *instance) { huy(instance); }
                      g_GWorld, g_GNames, g_GUObjectArray,
                      g_World, g_Controller, g_CameraManager,
                      g_ActorArray, g_ActorCount, g_ViewMatOff, g_ProjMatOff);
-            // If some offsets missing, schedule re-scan after 10 sec
+            LogOffsetsToFile();
+            // Re-scan if missing
             if (!g_GWorld || !g_GNames || !g_GUObjectArray || !g_ActorArray) {
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    // Re‑scan
                     ScanOffsets();
                     snprintf(scanResult, sizeof(scanResult),
                              "GWorld: 0x%lx\nGNames: 0x%lx\nGUObjectArray: 0x%lx\n"
@@ -337,58 +344,20 @@ void _huy(void *instance) { huy(instance); }
                              g_GWorld, g_GNames, g_GUObjectArray,
                              g_World, g_Controller, g_CameraManager,
                              g_ActorArray, g_ActorCount, g_ViewMatOff, g_ProjMatOff);
+                    LogOffsetsToFile();
                 });
             }
         }
     });
 }
 
-#pragma mark - Hit-testing to pass touches through to game
-
-- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
-    // If menu is closed, never capture touches
-    if (!MenDeal) return NO;
-    // If menu window size is zero (not yet drawn), don't capture
-    if (g_MenuWindowSize.x == 0 && g_MenuWindowSize.y == 0) return NO;
-    ImVec2 pos = g_MenuWindowPos;
-    ImVec2 size = g_MenuWindowSize;
-    CGRect menuRect = CGRectMake(pos.x, pos.y, size.x, size.y);
-    return CGRectContainsPoint(menuRect, point);
-}
-
-#pragma mark - Touch events
-
-- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-    [self updateIOWithTouchEvent:event];
-}
-- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-    [self updateIOWithTouchEvent:event];
-}
-- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-    [self updateIOWithTouchEvent:event];
-}
-- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-    [self updateIOWithTouchEvent:event];
-}
-
-- (void)updateIOWithTouchEvent:(UIEvent *)event {
-    UITouch *anyTouch = event.allTouches.anyObject;
-    CGPoint touchLocation = [anyTouch locationInView:self.view];
-    ImGuiIO &io = ImGui::GetIO();
-    io.MousePos = ImVec2(touchLocation.x, touchLocation.y);
-    BOOL hasActiveTouch = NO;
-    for (UITouch *touch in event.allTouches) {
-        if (touch.phase != UITouchPhaseEnded && touch.phase != UITouchPhaseCancelled) {
-            hasActiveTouch = YES;
-            break;
-        }
-    }
-    io.MouseDown[0] = hasActiveTouch;
-}
-
 #pragma mark - MTKViewDelegate
 
 - (void)drawInMTKView:(MTKView*)view {
+    // ----- SIMPLE TOUCH TOGGLE (like before) -----
+    // When menu is open, view captures touches; when closed, view ignores touches (game gets them)
+    [self.view setUserInteractionEnabled:MenDeal];
+
     ImGuiIO& io = ImGui::GetIO();
     io.DisplaySize.x = view.bounds.size.width;
     io.DisplaySize.y = view.bounds.size.height;
@@ -426,15 +395,7 @@ void _huy(void *instance) { huy(instance); }
             ImGui::Separator();
             ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
             ImGui::End();
-
-            g_MenuWindowPos = ImGui::GetWindowPos();
-            g_MenuWindowSize = ImGui::GetWindowSize();
-        } else {
-            g_MenuWindowSize = ImVec2(0,0);
         }
-
-        // --- Manual scan button (optional, keep for fallback) ---
-        // We removed it to avoid clutter, but can keep if needed.
 
         // --- ESP Drawing ---
         ImDrawList* drawList = ImGui::GetForegroundDrawList();
@@ -556,7 +517,7 @@ static void loadMenu() {
                 }
             }
         } else {
-            window = [[UIApplication sharedApplication] keyWindow]; // deprecated but fine
+            window = [[UIApplication sharedApplication] keyWindow];
         }
         if (window) {
             ImGuiDrawView *vc = [[ImGuiDrawView alloc] init];
