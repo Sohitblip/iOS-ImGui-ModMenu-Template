@@ -3,6 +3,7 @@
 #import <Foundation/Foundation.h>
 #import <mach-o/dyld.h>
 #import <mach/mach.h>
+#import <Security/Security.h>
 
 // Imgui library
 #import "Esp/CaptainHook.h"
@@ -27,7 +28,7 @@
 struct Vector3 { float X; float Y; float Z; };
 struct Vector2 { float X; float Y; };
 
-// --- PUBG GL 4.5 OFFSETS ---
+// --- PUBG GL OFFSETS ---
 #define OFF_UWorld              0x10C034388
 #define OFF_BonePos             0x10356B00C
 #define OFF_GWorld_Data         0x10AA11EA0
@@ -50,7 +51,7 @@ static uintptr_t g_BaseAddress = 0;
 // Safe Memory Reader
 template <typename T>
 static inline T ReadMemory(uintptr_t address, T defaultValue = T()) {
-    if (!address || address < 0x100000000 || address > 0x3000000000) return defaultValue;
+    if (!address || address < 0x10000000) return defaultValue;
     T buffer;
     vm_size_t size = 0;
     kern_return_t kr = vm_read_overwrite(mach_task_self(), (vm_address_t)address, sizeof(T), (vm_address_t)&buffer, &size);
@@ -58,6 +59,50 @@ static inline T ReadMemory(uintptr_t address, T defaultValue = T()) {
         return buffer;
     }
     return defaultValue;
+}
+
+// Complete Guest ID Reset Routine
+static void ResetPUBGGuestAccount() {
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    
+    NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *libPath = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject];
+    
+    NSArray *pathsToDelete = @[
+        [docPath stringByAppendingPathComponent:@"ShadowTrackerExtra/Saved/SaveGames"],
+        [docPath stringByAppendingPathComponent:@"ShadowTrackerExtra/Saved/Paks/puffer_temp"],
+        [docPath stringByAppendingPathComponent:@"ShadowTrackerExtra/Saved/StatEventReportedFlag"],
+        [docPath stringByAppendingPathComponent:@"ShadowTrackerExtra/Saved/Logs"],
+        [docPath stringByAppendingPathComponent:@"ShadowTrackerExtra/Saved/GameErrorNoRecords.txt"],
+        [libPath stringByAppendingPathComponent:@"Caches"],
+        [libPath stringByAppendingPathComponent:@"Preferences"]
+    ];
+    
+    for (NSString *path in pathsToDelete) {
+        if ([fileManager fileExistsAtPath:path]) {
+            NSError *error = nil;
+            [fileManager removeItemAtPath:path error:&error];
+        }
+    }
+    
+    // Clear NSUserDefaults
+    NSString *appDomain = [[NSBundle mainBundle] bundleIdentifier];
+    [[NSUserDefaults standardUserDefaults] removePersistentDomainForName:appDomain];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    
+    // Clear Keychain Items
+    NSArray *secClasses = @[
+        (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecClassInternetPassword,
+        (__bridge id)kSecClassCertificate,
+        (__bridge id)kSecClassKey,
+        (__bridge id)kSecClassIdentity
+    ];
+    
+    for (id secClass in secClasses) {
+        NSDictionary *spec = @{(__bridge id)kSecClass: secClass};
+        SecItemDelete((__bridge CFDictionaryRef)spec);
+    }
 }
 
 // Bools for menu switches
@@ -177,7 +222,7 @@ void _huy(void *instance) {
         CGFloat y = (([UIApplication sharedApplication].windows[0].rootViewController.view.frame.size.height) - 300) / 2;
         
         ImGui::SetNextWindowPos(ImVec2(x, y), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(360, 260), ImGuiCond_FirstUseEver); 
+        ImGui::SetNextWindowSize(ImVec2(360, 290), ImGuiCond_FirstUseEver); 
         
         // ------------------ ImGui Mod Menu ------------------
         if (MenDeal) 
@@ -192,51 +237,102 @@ void _huy(void *instance) {
                 ImGui::Checkbox("Debug Telemetry", &show_DebugMonitor);
                 
                 ImGui::Separator();
+                
+                // Guest Reset Button with Auto-Restart
+                if (ImGui::Button("Reset Guest ID (Clean & Exit)", ImVec2(-1, 28))) {
+                    ResetPUBGGuestAccount();
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                        exit(0);
+                    });
+                }
+                
+                ImGui::Separator();
                 ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
             ImGui::End();   
         }
         
-        // ------------------ Real Dynamic ESP Engine ------------------
+        // ------------------ Dynamic ESP Engine ------------------
         ImDrawList* drawList = ImGui::GetForegroundDrawList();
 
         uintptr_t gWorldPtr = 0;
         void* playerController = nullptr;
+        uintptr_t persistentLevel = 0;
+        uintptr_t actorArrayAddr = 0;
+        int actorCount = 0;
         int validActorsFound = 0;
 
         if (g_BaseAddress) {
-            // Read UWorld via offset pointer or static Data address
             gWorldPtr = ReadMemory<uintptr_t>(g_BaseAddress + OFF_UWorld);
             if (!gWorldPtr) {
                 gWorldPtr = ReadMemory<uintptr_t>(g_BaseAddress + OFF_GWorld_Data);
             }
 
             if (gWorldPtr) {
-                // GameInstance -> LocalPlayer -> PlayerController
-                uintptr_t gameInstance = ReadMemory<uintptr_t>(gWorldPtr + 0x24);
-                if (gameInstance) {
-                    uintptr_t localPlayers = ReadMemory<uintptr_t>(gameInstance + 0x38);
-                    uintptr_t localPlayer = ReadMemory<uintptr_t>(localPlayers);
-                    playerController = (void*)ReadMemory<uintptr_t>(localPlayer + 0x30);
+                // Multi-Path Controller Scanner
+                uintptr_t gameInstanceOffsets[] = {0x24, 0x90, 0x88, 0x38, 0x140};
+                for (int gi = 0; gi < 5; gi++) {
+                    uintptr_t gameInstance = ReadMemory<uintptr_t>(gWorldPtr + gameInstanceOffsets[gi]);
+                    if (!gameInstance) continue;
+
+                    uintptr_t localPlayersOffsets[] = {0x38, 0x40, 0x30, 0x98};
+                    for (int lp = 0; lp < 4; lp++) {
+                        uintptr_t localPlayers = ReadMemory<uintptr_t>(gameInstance + localPlayersOffsets[lp]);
+                        if (!localPlayers) continue;
+
+                        uintptr_t localPlayer = ReadMemory<uintptr_t>(localPlayers);
+                        if (!localPlayer) continue;
+
+                        uintptr_t pcOffsets[] = {0x30, 0x28, 0x20, 0x38};
+                        for (int pci = 0; pci < 4; pci++) {
+                            void* pcCandidate = (void*)ReadMemory<uintptr_t>(localPlayer + pcOffsets[pci]);
+                            if (pcCandidate && (uintptr_t)pcCandidate > 0x10000000) {
+                                playerController = pcCandidate;
+                                break;
+                            }
+                        }
+                        if (playerController) break;
+                    }
+                    if (playerController) break;
                 }
 
-                // PersistentLevel -> ActorArray
-                uintptr_t persistentLevel = ReadMemory<uintptr_t>(gWorldPtr + 0x30);
-                if (!persistentLevel) persistentLevel = ReadMemory<uintptr_t>(gWorldPtr + 0x20);
+                // Level & Actor Array Scanner
+                uintptr_t levelOffsets[] = {0x30, 0x20, 0x90, 0x98, 0x138};
+                for (int li = 0; li < 5; li++) {
+                    uintptr_t lvlCandidate = ReadMemory<uintptr_t>(gWorldPtr + levelOffsets[li]);
+                    if (lvlCandidate && lvlCandidate > 0x10000000) {
+                        uintptr_t arrOffsets[] = {0x98, 0xA0, 0xA8, 0x70};
+                        for (int ai = 0; ai < 4; ai++) {
+                            uintptr_t arr = ReadMemory<uintptr_t>(lvlCandidate + arrOffsets[ai]);
+                            int cnt = ReadMemory<int>(lvlCandidate + arrOffsets[ai] + 0x8);
+                            if (arr && cnt > 0 && cnt < 2048) {
+                                persistentLevel = lvlCandidate;
+                                actorArrayAddr = arr;
+                                actorCount = cnt;
+                                break;
+                            }
+                        }
+                        if (actorArrayAddr) break;
+                    }
+                }
 
-                uintptr_t actorArrayAddr = ReadMemory<uintptr_t>(persistentLevel + 0x98);
-                if (!actorArrayAddr) actorArrayAddr = ReadMemory<uintptr_t>(persistentLevel + 0xA0);
-                int actorCount = ReadMemory<int>(persistentLevel + 0xA0);
-
-                if (actorCount > 0 && actorCount < 2048 && actorArrayAddr && playerController && ProjectWorldLocationToScreen) {
+                // Render Live ESP
+                if (actorCount > 0 && actorArrayAddr && playerController && ProjectWorldLocationToScreen) {
                     for (int i = 0; i < actorCount; i++) {
                         uintptr_t actor = ReadMemory<uintptr_t>(actorArrayAddr + (i * sizeof(uintptr_t)));
                         if (!actor) continue;
 
-                        uintptr_t rootComp = ReadMemory<uintptr_t>(actor + 0x140);
-                        if (!rootComp) rootComp = ReadMemory<uintptr_t>(actor + 0x130);
+                        uintptr_t rootOffsets[] = {0x140, 0x130, 0x138, 0x148, 0x180};
+                        uintptr_t rootComp = 0;
+                        for (int r = 0; r < 5; r++) {
+                            rootComp = ReadMemory<uintptr_t>(actor + rootOffsets[r]);
+                            if (rootComp && rootComp > 0x10000000) break;
+                        }
                         if (!rootComp) continue;
 
                         Vector3 actorPos = ReadMemory<Vector3>(rootComp + 0x120);
+                        if (actorPos.X == 0 && actorPos.Y == 0 && actorPos.Z == 0) {
+                            actorPos = ReadMemory<Vector3>(rootComp + 0x11C);
+                        }
                         if (actorPos.X == 0 && actorPos.Y == 0 && actorPos.Z == 0) continue;
 
                         Vector3 headPos = actorPos; headPos.Z += 80.0f;
@@ -276,27 +372,14 @@ void _huy(void *instance) {
             }
         }
 
-        // ------------------ Force Preview Overlay (If not in match) ------------------
+        // ------------------ Telemetry Monitor ------------------
         if (show_DebugMonitor) {
             char debugText[256];
             snprintf(debugText, sizeof(debugText), 
-                     "PUBG Telemetry\nBase: 0x%lx\nGWorld: 0x%lx\nController: %p\nLive ESP Rendered: %d", 
-                     g_BaseAddress, gWorldPtr, playerController, validActorsFound);
-            drawList->AddRectFilled(ImVec2(20, 40), ImVec2(240, 120), IM_COL32(0, 0, 0, 160), 6.0f);
+                     "PUBG Telemetry\nBase: 0x%lx\nGWorld: 0x%lx\nController: %p\nActors in Level: %d\nRendered ESP: %d", 
+                     g_BaseAddress, gWorldPtr, playerController, actorCount, validActorsFound);
+            drawList->AddRectFilled(ImVec2(20, 40), ImVec2(240, 130), IM_COL32(0, 0, 0, 180), 6.0f);
             drawList->AddText(ImVec2(28, 48), IM_COL32(0, 255, 128, 255), debugText);
-
-            // Match ke bahar Lobby me check karne ke liye live screen indicators
-            if (validActorsFound == 0 && show_ESPLine) {
-                drawList->AddLine(
-                    ImVec2(view.bounds.size.width / 2.0f, 60.0f),
-                    ImVec2(view.bounds.size.width / 2.0f, view.bounds.size.height / 2.0f),
-                    IM_COL32(0, 255, 255, 180), 1.0f
-                );
-                drawList->AddText(
-                    ImVec2(view.bounds.size.width / 2.0f - 50.0f, view.bounds.size.height / 2.0f + 10.0f),
-                    IM_COL32(0, 255, 255, 255), "Radar Active"
-                );
-            }
         }
 
         // ------------------ ImGui Render Pass ------------------
