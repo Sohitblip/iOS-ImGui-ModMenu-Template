@@ -15,10 +15,11 @@ jobs:
       - name: Compile Standalone Dylib via Clang
         run: |
           xcrun -sdk iphoneos clang++ -dynamiclib -arch arm64 \
+          -std=c++11 -stdlib=libc++ \
           -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
-          -Dtheos_tweaks_compat=1 -DSO_NOSIGPIPE=1 \
+          -Dtheos_tweaks_compat=1 -DSO_NOSIGPIPE=1 -D__HE_HEADER_PASSTHROUGH__=1 \
           -framework UIKit -framework Foundation -framework CoreGraphics -framework Metal -framework MetalKit \
-          -I./IMGUI -I./Esp -I./5Toubun \
+          -I./Esp -I./5Toubun \
           ImGuiDrawView.mm IMGUI/*.cpp -o libPUBGOverlay.dylib
 
       - name: Upload Compiled Binary Artifact
