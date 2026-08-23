@@ -42,18 +42,6 @@ struct Vector2 { float X; float Y; };
 typedef bool (*_ProjectWorldLocationToScreen)(void* PlayerController, Vector3 WorldLocation, Vector2& ScreenLocation, bool bPlayerViewportRelative);
 static _ProjectWorldLocationToScreen ProjectWorldLocationToScreen = nullptr;
 
-// Auto-initialize ASLR base address & W2S function pointer after 5 seconds
-__attribute__((constructor))
-static void initializePUBGOffsets() {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        // Slide / ASLR calculation to get main executable address space
-        uintptr_t baseAddress = (uintptr_t)_dyld_get_image_header(0);
-        
-        // Linking the engine function pointer directly to game's native rendering function
-        ProjectWorldLocationToScreen = (_ProjectWorldLocationToScreen)(baseAddress + OFF_W2S_Function);
-    });
-}
-
 // Bools for menu switches
 static bool MenDeal = true;
 static bool show_ESPBox = false;
@@ -249,18 +237,37 @@ void _huy(void *instance) {
 
 - (void)mtkView:(MTKView*)view drawableSizeWillChange:(CGSize)size
 {
-// --- FORCE LOAD ENGINE FOR NON-JAILBREAK (ESIGN) ---
+    
+}
+
+@end
+
+// =========================================================
+// GLOBAL CONSTRUCTORS (Executes on dylib load)
+// =========================================================
+
+// 1. Initialize PUBG Offsets & W2S function pointer
+__attribute__((constructor))
+static void initializePUBGOffsets() {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        uintptr_t baseAddress = (uintptr_t)_dyld_get_image_header(0);
+        ProjectWorldLocationToScreen = (_ProjectWorldLocationToScreen)(baseAddress + OFF_W2S_Function);
+    });
+}
+
+// 2. Force Load Menu Window for Non-Jailbreak / ESign / TrollStore
 __attribute__((constructor))
 static void forceLoadMenuInEsign() {
-    // Game khulne ke thik 3 second baad yeh menu ko har haal mein screen par le aayega
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        
         UIWindow *window = nil;
         if (@available(iOS 13.0, *)) {
             for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
                 if (scene.activationState == UISceneActivationStateForegroundActive) {
                     for (UIWindow *w in scene.windows) {
-                        if (w.isKeyWindow) { window = w; break; }
+                        if (w.isKeyWindow) { 
+                            window = w; 
+                            break; 
+                        }
                     }
                 }
             }
@@ -269,16 +276,10 @@ static void forceLoadMenuInEsign() {
         }
 
         if (window) {
-            // ImGuiDrawView Controller ko direct top layer par force attach karna
             ImGuiDrawView *vc = [[ImGuiDrawView alloc] init];
             [window addSubview:vc.view];
             [window.rootViewController addChildViewController:vc];
-            [ImGuiDrawView showChange:YES]; // Menu ko default OPEN state me lana
+            [ImGuiDrawView showChange:YES];
         }
     });
 }
-
-    
-}
-
-@end
