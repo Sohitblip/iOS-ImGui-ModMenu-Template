@@ -1,0 +1,32 @@
+name: Compile iOS Overlay Dylib
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build_library:
+    runs-on: macos-14
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Theos Environment
+        run: |
+          bash -c "$(curl -fsSL https://githubusercontent.com)"
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+
+      - name: Compile dylib via Xcode Clang
+        run: |
+          xcrun -sdk iphoneos clang++ -dynamiclib -arch arm64 \
+          -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
+          -framework UIKit -framework Foundation -framework CoreGraphics -framework Metal -framework MetalKit \
+          -I./IMGUI -I./Esp -I./5Toubun \
+          ImGuiDrawView.mm -o libPUBGOverlay.dylib
+
+      - name: Upload Compiled Binary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Compiled-PUBG-Dylib
+          path: libPUBGOverlay.dylib
