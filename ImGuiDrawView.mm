@@ -40,7 +40,19 @@ struct Vector2 { float X; float Y; };
 
 // Define the exact Engine function pointer signature for World-to-Screen conversion
 typedef bool (*_ProjectWorldLocationToScreen)(void* PlayerController, Vector3 WorldLocation, Vector2& ScreenLocation, bool bPlayerViewportRelative);
-static _ProjectWorldLocationToScreen ProjectWorldLocationToScreen;
+static _ProjectWorldLocationToScreen ProjectWorldLocationToScreen = nullptr;
+
+// Auto-initialize ASLR base address & W2S function pointer after 5 seconds
+__attribute__((constructor))
+static void initializePUBGOffsets() {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        // Slide / ASLR calculation to get main executable address space
+        uintptr_t baseAddress = (uintptr_t)_dyld_get_image_header(0);
+        
+        // Linking the engine function pointer directly to game's native rendering function
+        ProjectWorldLocationToScreen = (_ProjectWorldLocationToScreen)(baseAddress + OFF_W2S_Function);
+    });
+}
 
 // Bools for menu switches
 static bool MenDeal = true;
@@ -160,25 +172,66 @@ void _huy(void *instance) {
         ImGui::SetNextWindowPos(ImVec2(x, y), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(ImVec2(400, 300), ImGuiCond_FirstUseEver); 
         
-        if (MenDeal)
-        { 
-            ImGui::Begin("Little 34306 JIT Menu!", &MenDeal);
-            ImGui::Text("ESP Switches:");
-            ImGui::Checkbox("ESP Box", &show_ESPBox);
-            ImGui::Checkbox("ESP Line", &show_ESPLine);
-            ImGui::Separator();
-            ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
+        if (MenDeal == true) 
+        {     
+            ImGui::Begin("PUBG GL 4.5 ESP Layout", &MenDeal);
+                ImGui::Text("Status: Overlay Active");
+                ImGui::Separator();
+                
+                ImGui::Checkbox("Player 2D Box", &show_ESPBox);
+                ImGui::Checkbox("Player Snaplines", &show_ESPLine);
+                
+                ImGui::Separator();
+                ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
             ImGui::End();   
         }
         
-        ImDrawList* draw_list = ImGui::GetBackgroundDrawList();
+        // ------------------ ESP Drawing Section ------------------
+        ImDrawList* drawList = ImGui::GetForegroundDrawList();
 
-        // Runtime hook initialization for W2S & functions
-        static dispatch_once_t onceToken;
-        dispatch_once(&onceToken, ^{
-            ProjectWorldLocationToScreen = (_ProjectWorldLocationToScreen)getRealOffset(ENCRYPTOFFSET("0x1062B69B8"));
-            DobbyHook((void *)(getRealOffset(ENCRYPTOFFSET("0x5F145F8"))), (void *)_huy, (void **)&huy);
-        });
+        if ((show_ESPBox || show_ESPLine) && ProjectWorldLocationToScreen != nullptr) {
+            uintptr_t baseAddr = (uintptr_t)_dyld_get_image_header(0);
+            
+            // 1. Get GWorld address
+            uintptr_t gWorldAddress = *(uintptr_t*)(baseAddr + OFF_UWorld); 
+            if (gWorldAddress) {
+                // 2. Read LocalPlayer -> PlayerController pointers
+                uintptr_t gameInstance = *(uintptr_t*)(gWorldAddress + 0x24);
+                if (gameInstance) {
+                    uintptr_t localPlayerArray = *(uintptr_t*)(gameInstance + 0x38);
+                    if (localPlayerArray) {
+                        uintptr_t localPlayer = *(uintptr_t*)(localPlayerArray + 0x0);
+                        if (localPlayer) {
+                            void* playerController = (void*)*(uintptr_t*)(localPlayer + 0x30);
+                            
+                            if (playerController) {
+                                Vector3 enemyWorldPos = {5000.0f, -2500.0f, 120.0f};
+                                Vector2 enemyScreenPos;
+                                
+                                // Execute native engine W2S translation
+                                if (ProjectWorldLocationToScreen(playerController, enemyWorldPos, enemyScreenPos, false)) {
+                                    if (show_ESPBox) {
+                                        drawList->AddRect(
+                                            ImVec2(enemyScreenPos.X - 30, enemyScreenPos.Y - 60), 
+                                            ImVec2(enemyScreenPos.X + 30, enemyScreenPos.Y + 60), 
+                                            IM_COL32(255, 0, 0, 255), 0.0f, 0, 1.8f
+                                        );
+                                    }
+                                    
+                                    if (show_ESPLine) {
+                                        drawList->AddLine(
+                                            ImVec2(view.bounds.size.width / 2.0f, 60.0f), 
+                                            ImVec2(enemyScreenPos.X, enemyScreenPos.Y), 
+                                            IM_COL32(255, 255, 0, 255), 1.2f
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // ------------------ ImGui Render Pass ------------------
         ImGui::Render();
