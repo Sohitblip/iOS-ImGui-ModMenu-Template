@@ -12,18 +12,17 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Setup Theos Environment
+      - name: Compile Standalone Dylib via Clang
         run: |
-          bash -c "$(curl -fsSL https://githubusercontent.com)"
-          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
-
-      - name: Compile via Native Theos Makefile
-        run: |
-          export THEOS=$HOME/theos
-          make THEOS_PACKAGE_SCHEME=rootless ARCHS="arm64" FINALPACKAGE=1
+          xcrun -sdk iphoneos clang++ -dynamiclib -arch arm64 \
+          -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
+          -Dtheos_tweaks_compat=1 -DSO_NOSIGPIPE=1 \
+          -framework UIKit -framework Foundation -framework CoreGraphics -framework Metal -framework MetalKit \
+          -I./IMGUI -I./Esp -I./5Toubun \
+          ImGuiDrawView.mm IMGUI/*.cpp -o libPUBGOverlay.dylib
 
       - name: Upload Compiled Binary Artifact
         uses: actions/upload-artifact@v4
         with:
           name: Compiled-PUBG-Dylib
-          path: .theos/obj/debug/*.dylib
+          path: libPUBGOverlay.dylib
