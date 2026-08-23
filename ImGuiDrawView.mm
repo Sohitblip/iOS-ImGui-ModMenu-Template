@@ -67,26 +67,63 @@ static bool IsValidVTable(uintptr_t obj) {
     return true;
 }
 
+// --------------------------------------------------------------------
+// Matrix detection functions (MUST be defined before ScanOffsets)
+// --------------------------------------------------------------------
+struct FMinimalViewInfo {
+    Vector3 Location;
+    Vector3 Rotation;
+    float FOV;
+};
+
+struct FCameraCacheEntry {
+    float Timestamp;
+    FMinimalViewInfo POV;
+};
+
+static bool DetectMatrixOffsets(uintptr_t CameraManager, int& outViewOff, int& outProjOff) {
+    if (!CameraManager) return false;
+    uintptr_t cacheAddr = CameraManager + 0x4B0; // OFF_CameraCache (common)
+    FCameraCacheEntry cache = ReadMemory<FCameraCacheEntry>(cacheAddr);
+    if (cache.Timestamp == 0) return false;
+    uintptr_t povAddr = cacheAddr + offsetof(FCameraCacheEntry, POV);
+    int candidates[] = {0x10,0x20,0x30,0x40,0x50,0x60,0x70,0x80,0x90,0xA0,0xB0,0xC0};
+    for (int vOff : candidates) {
+        for (int pOff : candidates) {
+            if (vOff == pOff) continue;
+            float view[16], proj[16];
+            memcpy(view, (void*)(povAddr + vOff), 16*sizeof(float));
+            memcpy(proj, (void*)(povAddr + pOff), 16*sizeof(float));
+            float sum = 0; for (int i=0;i<16;i++) sum += fabsf(view[i]);
+            if (sum < 0.1f) continue;
+            sum = 0; for (int i=0;i<16;i++) sum += fabsf(proj[i]);
+            if (sum < 0.1f) continue;
+            outViewOff = vOff;
+            outProjOff = pOff;
+            return true;
+        }
+    }
+    return false;
+}
+// --------------------------------------------------------------------
+
 // --- Pattern scanning for GNames (look for "None" string) ---
 static uintptr_t FindGNames() {
-    // Scan the entire binary for the string "None"
     const char* pattern = "None";
     size_t len = strlen(pattern);
-    uintptr_t end = g_BaseAddress + 0x1000000; // scan first 16MB (adjust if needed)
+    uintptr_t end = g_BaseAddress + 0x1000000; // scan first 16MB
     for (uintptr_t addr = g_BaseAddress; addr < end; ++addr) {
         char buf[5];
         vm_size_t size = 0;
         if (vm_read_overwrite(mach_task_self(), (vm_address_t)addr, len, (vm_address_t)buf, &size) == KERN_SUCCESS && size == len) {
             if (strncmp(buf, pattern, len) == 0) {
-                // Found "None" – now scan for a pointer to this address (which would be GNames)
+                // Found "None" – now scan for a pointer to this address
                 for (uintptr_t p = g_BaseAddress; p < g_BaseAddress + 0x1000000; p += 4) {
                     uintptr_t ptr = ReadMemory<uintptr_t>(p);
                     if (ptr == addr) {
-                        // This could be a pointer to the name pool. Return the pointer location (offset)
-                        return p;
+                        return p; // pointer location (offset)
                     }
                 }
-                // If we found the string but no pointer to it, we can't be sure.
                 break;
             }
         }
@@ -180,7 +217,7 @@ static void ScanOffsets() {
         }
     }
 
-    // 4. Auto‑detect matrix offsets (as before)
+    // 4. Auto‑detect matrix offsets (uses DetectMatrixOffsets now defined above)
     if (g_CameraManager) {
         int vOff, pOff;
         if (DetectMatrixOffsets(g_CameraManager, vOff, pOff)) {
@@ -188,43 +225,6 @@ static void ScanOffsets() {
             g_ProjMatOff = pOff;
         }
     }
-}
-
-// --- Matrix detection (unchanged) ---
-struct FMinimalViewInfo {
-    Vector3 Location;
-    Vector3 Rotation;
-    float FOV;
-};
-
-struct FCameraCacheEntry {
-    float Timestamp;
-    FMinimalViewInfo POV;
-};
-
-static bool DetectMatrixOffsets(uintptr_t CameraManager, int& outViewOff, int& outProjOff) {
-    if (!CameraManager) return false;
-    uintptr_t cacheAddr = CameraManager + 0x4B0;
-    FCameraCacheEntry cache = ReadMemory<FCameraCacheEntry>(cacheAddr);
-    if (cache.Timestamp == 0) return false;
-    uintptr_t povAddr = cacheAddr + offsetof(FCameraCacheEntry, POV);
-    int candidates[] = {0x10,0x20,0x30,0x40,0x50,0x60,0x70,0x80,0x90,0xA0,0xB0,0xC0};
-    for (int vOff : candidates) {
-        for (int pOff : candidates) {
-            if (vOff == pOff) continue;
-            float view[16], proj[16];
-            memcpy(view, (void*)(povAddr + vOff), 16*sizeof(float));
-            memcpy(proj, (void*)(povAddr + pOff), 16*sizeof(float));
-            float sum = 0; for (int i=0;i<16;i++) sum += fabsf(view[i]);
-            if (sum < 0.1f) continue;
-            sum = 0; for (int i=0;i<16;i++) sum += fabsf(proj[i]);
-            if (sum < 0.1f) continue;
-            outViewOff = vOff;
-            outProjOff = pOff;
-            return true;
-        }
-    }
-    return false;
 }
 
 // --- W2S ---
@@ -308,40 +308,31 @@ void _huy(void *instance) { huy(instance); }
     self.mtkView.clearColor = MTLClearColorMake(0, 0, 0, 0);
     self.mtkView.backgroundColor = [UIColor colorWithRed:0 green:0 blue:0 alpha:0];
     self.mtkView.clipsToBounds = YES;
-    // Enable user interaction; hit-testing will decide when to capture touches
     self.view.userInteractionEnabled = YES;
 }
 
 #pragma mark - Hit-testing to pass touches through to game
 
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
-    // If menu is closed, let all touches pass through
     if (!MenDeal) return NO;
-
-    // If menu window is not initialized, allow touches (they will be ignored by ImGui)
     if (g_MenuWindowSize.x == 0 && g_MenuWindowSize.y == 0) return YES;
-
-    // Convert point to ImGui coordinate (same as view coordinates)
     ImVec2 pos = g_MenuWindowPos;
     ImVec2 size = g_MenuWindowSize;
     CGRect menuRect = CGRectMake(pos.x, pos.y, size.x, size.y);
     return CGRectContainsPoint(menuRect, point);
 }
 
-#pragma mark - Touch events (only called if pointInside returns YES)
+#pragma mark - Touch events
 
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     [self updateIOWithTouchEvent:event];
 }
-
 - (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     [self updateIOWithTouchEvent:event];
 }
-
 - (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     [self updateIOWithTouchEvent:event];
 }
-
 - (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     [self updateIOWithTouchEvent:event];
 }
@@ -372,7 +363,6 @@ void _huy(void *instance) { huy(instance); }
     io.DeltaTime = 1 / float(view.preferredFramesPerSecond ?: 120);
 
     id<MTLCommandBuffer> commandBuffer = [self.commandQueue commandBuffer];
-    // No need to set userInteractionEnabled here – hit-testing handles it
 
     MTLRenderPassDescriptor* renderPassDescriptor = view.currentRenderPassDescriptor;
     if (renderPassDescriptor != nil) {
@@ -408,11 +398,9 @@ void _huy(void *instance) { huy(instance); }
             ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
             ImGui::End();
 
-            // Store window rect for hit-testing
             g_MenuWindowPos = ImGui::GetWindowPos();
             g_MenuWindowSize = ImGui::GetWindowSize();
         } else {
-            // Menu closed – reset rect so touches pass through
             g_MenuWindowSize = ImVec2(0,0);
         }
 
@@ -549,7 +537,7 @@ static void loadMenu() {
                 }
             }
         } else {
-            window = [[UIApplication sharedApplication] keyWindow];
+            window = [[UIApplication sharedApplication] keyWindow]; // deprecated, but fine for < iOS 13
         }
         if (window) {
             ImGuiDrawView *vc = [[ImGuiDrawView alloc] init];
