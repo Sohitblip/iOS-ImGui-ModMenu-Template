@@ -2,6 +2,7 @@
 #import <MetalKit/MetalKit.h>
 #import <Foundation/Foundation.h>
 #import <mach-o/dyld.h>
+#import <mach/mach.h>
 
 // Imgui library
 #import "Esp/CaptainHook.h"
@@ -38,14 +39,33 @@ struct Vector2 { float X; float Y; };
 #define OFF_ActorArray          0x1063693F0
 #define OFF_W2S_Function        0x1062B69B8
 
-// Define the exact Engine function pointer signature for World-to-Screen conversion
+// Function pointer signature
 typedef bool (*_ProjectWorldLocationToScreen)(void* PlayerController, Vector3 WorldLocation, Vector2& ScreenLocation, bool bPlayerViewportRelative);
+typedef Vector3 (*_GetBonePos)(void* Mesh, int BoneId);
+
 static _ProjectWorldLocationToScreen ProjectWorldLocationToScreen = nullptr;
+static _GetBonePos GetBonePos = nullptr;
+static uintptr_t g_BaseAddress = 0;
+
+// Safe Memory Reader
+template <typename T>
+static inline T ReadMemory(uintptr_t address, T defaultValue = T()) {
+    if (!address || address < 0x100000000 || address > 0x3000000000) return defaultValue;
+    T buffer;
+    vm_size_t size = 0;
+    kern_return_t kr = vm_read_overwrite(mach_task_self(), (vm_address_t)address, sizeof(T), (vm_address_t)&buffer, &size);
+    if (kr == KERN_SUCCESS && size == sizeof(T)) {
+        return buffer;
+    }
+    return defaultValue;
+}
 
 // Bools for menu switches
 static bool MenDeal = true;
-static bool show_ESPBox = false;
-static bool show_ESPLine = false;
+static bool show_ESPBox = true;
+static bool show_ESPLine = true;
+static bool show_ESPDistance = true;
+static bool show_DebugMonitor = true;
 
 @interface ImGuiDrawView () <MTKViewDelegate>
 @property (nonatomic, strong) id <MTLDevice> device;
@@ -54,7 +74,6 @@ static bool show_ESPLine = false;
 
 @implementation ImGuiDrawView
 
-// Hooking function pointers
 void (*huy)(void *instance);
 void _huy(void *instance) {
     huy(instance);
@@ -158,66 +177,125 @@ void _huy(void *instance) {
         CGFloat y = (([UIApplication sharedApplication].windows[0].rootViewController.view.frame.size.height) - 300) / 2;
         
         ImGui::SetNextWindowPos(ImVec2(x, y), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(400, 300), ImGuiCond_FirstUseEver); 
+        ImGui::SetNextWindowSize(ImVec2(360, 260), ImGuiCond_FirstUseEver); 
         
-        if (MenDeal == true) 
+        // ------------------ ImGui Mod Menu ------------------
+        if (MenDeal) 
         {     
-            ImGui::Begin("PUBG GL 4.5 ESP Layout", &MenDeal);
-                ImGui::Text("Status: Overlay Active");
+            ImGui::Begin("PUBG GL 4.5 Overlay", &MenDeal);
+                ImGui::Text("Engine Status: Active");
                 ImGui::Separator();
                 
                 ImGui::Checkbox("Player 2D Box", &show_ESPBox);
                 ImGui::Checkbox("Player Snaplines", &show_ESPLine);
+                ImGui::Checkbox("Player Distance", &show_ESPDistance);
+                ImGui::Checkbox("Debug Telemetry", &show_DebugMonitor);
                 
                 ImGui::Separator();
                 ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
             ImGui::End();   
         }
         
-        // ------------------ ESP Drawing Section ------------------
+        // ------------------ Real Dynamic ESP Engine ------------------
         ImDrawList* drawList = ImGui::GetForegroundDrawList();
 
-        if ((show_ESPBox || show_ESPLine) && ProjectWorldLocationToScreen != nullptr) {
-            uintptr_t baseAddr = (uintptr_t)_dyld_get_image_header(0);
-            
-            // 1. Get GWorld address
-            uintptr_t gWorldAddress = *(uintptr_t*)(baseAddr + OFF_UWorld); 
-            if (gWorldAddress) {
-                // 2. Read LocalPlayer -> PlayerController pointers
-                uintptr_t gameInstance = *(uintptr_t*)(gWorldAddress + 0x24);
+        uintptr_t gWorldPtr = 0;
+        void* playerController = nullptr;
+        int validActorsFound = 0;
+
+        if (g_BaseAddress) {
+            // Read UWorld via offset pointer or static Data address
+            gWorldPtr = ReadMemory<uintptr_t>(g_BaseAddress + OFF_UWorld);
+            if (!gWorldPtr) {
+                gWorldPtr = ReadMemory<uintptr_t>(g_BaseAddress + OFF_GWorld_Data);
+            }
+
+            if (gWorldPtr) {
+                // GameInstance -> LocalPlayer -> PlayerController
+                uintptr_t gameInstance = ReadMemory<uintptr_t>(gWorldPtr + 0x24);
                 if (gameInstance) {
-                    uintptr_t localPlayerArray = *(uintptr_t*)(gameInstance + 0x38);
-                    if (localPlayerArray) {
-                        uintptr_t localPlayer = *(uintptr_t*)(localPlayerArray + 0x0);
-                        if (localPlayer) {
-                            void* playerController = (void*)*(uintptr_t*)(localPlayer + 0x30);
-                            
-                            if (playerController) {
-                                Vector3 enemyWorldPos = {5000.0f, -2500.0f, 120.0f};
-                                Vector2 enemyScreenPos;
-                                
-                                // Execute native engine W2S translation
-                                if (ProjectWorldLocationToScreen(playerController, enemyWorldPos, enemyScreenPos, false)) {
-                                    if (show_ESPBox) {
-                                        drawList->AddRect(
-                                            ImVec2(enemyScreenPos.X - 30, enemyScreenPos.Y - 60), 
-                                            ImVec2(enemyScreenPos.X + 30, enemyScreenPos.Y + 60), 
-                                            IM_COL32(255, 0, 0, 255), 0.0f, 0, 1.8f
-                                        );
-                                    }
-                                    
-                                    if (show_ESPLine) {
-                                        drawList->AddLine(
-                                            ImVec2(view.bounds.size.width / 2.0f, 60.0f), 
-                                            ImVec2(enemyScreenPos.X, enemyScreenPos.Y), 
-                                            IM_COL32(255, 255, 0, 255), 1.2f
-                                        );
-                                    }
-                                }
+                    uintptr_t localPlayers = ReadMemory<uintptr_t>(gameInstance + 0x38);
+                    uintptr_t localPlayer = ReadMemory<uintptr_t>(localPlayers);
+                    playerController = (void*)ReadMemory<uintptr_t>(localPlayer + 0x30);
+                }
+
+                // PersistentLevel -> ActorArray
+                uintptr_t persistentLevel = ReadMemory<uintptr_t>(gWorldPtr + 0x30);
+                if (!persistentLevel) persistentLevel = ReadMemory<uintptr_t>(gWorldPtr + 0x20);
+
+                uintptr_t actorArrayAddr = ReadMemory<uintptr_t>(persistentLevel + 0x98);
+                if (!actorArrayAddr) actorArrayAddr = ReadMemory<uintptr_t>(persistentLevel + 0xA0);
+                int actorCount = ReadMemory<int>(persistentLevel + 0xA0);
+
+                if (actorCount > 0 && actorCount < 2048 && actorArrayAddr && playerController && ProjectWorldLocationToScreen) {
+                    for (int i = 0; i < actorCount; i++) {
+                        uintptr_t actor = ReadMemory<uintptr_t>(actorArrayAddr + (i * sizeof(uintptr_t)));
+                        if (!actor) continue;
+
+                        uintptr_t rootComp = ReadMemory<uintptr_t>(actor + 0x140);
+                        if (!rootComp) rootComp = ReadMemory<uintptr_t>(actor + 0x130);
+                        if (!rootComp) continue;
+
+                        Vector3 actorPos = ReadMemory<Vector3>(rootComp + 0x120);
+                        if (actorPos.X == 0 && actorPos.Y == 0 && actorPos.Z == 0) continue;
+
+                        Vector3 headPos = actorPos; headPos.Z += 80.0f;
+                        Vector3 feetPos = actorPos; feetPos.Z -= 80.0f;
+
+                        Vector2 screenHead, screenFeet, screenPos;
+
+                        if (ProjectWorldLocationToScreen(playerController, headPos, screenHead, false) &&
+                            ProjectWorldLocationToScreen(playerController, feetPos, screenFeet, false) &&
+                            ProjectWorldLocationToScreen(playerController, actorPos, screenPos, false)) {
+
+                            validActorsFound++;
+
+                            float boxHeight = fabsf(screenFeet.Y - screenHead.Y);
+                            float boxWidth = boxHeight / 2.0f;
+                            float boxLeft = screenHead.X - (boxWidth / 2.0f);
+                            float boxRight = screenHead.X + (boxWidth / 2.0f);
+
+                            if (show_ESPLine) {
+                                drawList->AddLine(
+                                    ImVec2(view.bounds.size.width / 2.0f, 60.0f),
+                                    ImVec2(screenHead.X, screenHead.Y),
+                                    IM_COL32(255, 235, 59, 255), 1.5f
+                                );
+                            }
+
+                            if (show_ESPBox) {
+                                drawList->AddRect(
+                                    ImVec2(boxLeft, screenHead.Y),
+                                    ImVec2(boxRight, screenFeet.Y),
+                                    IM_COL32(255, 40, 40, 255), 0.0f, 0, 1.6f
+                                );
                             }
                         }
                     }
                 }
+            }
+        }
+
+        // ------------------ Force Preview Overlay (If not in match) ------------------
+        if (show_DebugMonitor) {
+            char debugText[256];
+            snprintf(debugText, sizeof(debugText), 
+                     "PUBG Telemetry\nBase: 0x%lx\nGWorld: 0x%lx\nController: %p\nLive ESP Rendered: %d", 
+                     g_BaseAddress, gWorldPtr, playerController, validActorsFound);
+            drawList->AddRectFilled(ImVec2(20, 40), ImVec2(240, 120), IM_COL32(0, 0, 0, 160), 6.0f);
+            drawList->AddText(ImVec2(28, 48), IM_COL32(0, 255, 128, 255), debugText);
+
+            // Match ke bahar Lobby me check karne ke liye live screen indicators
+            if (validActorsFound == 0 && show_ESPLine) {
+                drawList->AddLine(
+                    ImVec2(view.bounds.size.width / 2.0f, 60.0f),
+                    ImVec2(view.bounds.size.width / 2.0f, view.bounds.size.height / 2.0f),
+                    IM_COL32(0, 255, 255, 180), 1.0f
+                );
+                drawList->AddText(
+                    ImVec2(view.bounds.size.width / 2.0f - 50.0f, view.bounds.size.height / 2.0f + 10.0f),
+                    IM_COL32(0, 255, 255, 255), "Radar Active"
+                );
             }
         }
 
@@ -243,22 +321,23 @@ void _huy(void *instance) {
 @end
 
 // =========================================================
-// GLOBAL CONSTRUCTORS (Executes on dylib load)
+// GLOBAL CONSTRUCTORS
 // =========================================================
 
-// 1. Initialize PUBG Offsets & W2S function pointer
 __attribute__((constructor))
 static void initializePUBGOffsets() {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        uintptr_t baseAddress = (uintptr_t)_dyld_get_image_header(0);
-        ProjectWorldLocationToScreen = (_ProjectWorldLocationToScreen)(baseAddress + OFF_W2S_Function);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        g_BaseAddress = (uintptr_t)_dyld_get_image_header(0);
+        if (g_BaseAddress) {
+            ProjectWorldLocationToScreen = (_ProjectWorldLocationToScreen)(g_BaseAddress + OFF_W2S_Function);
+            GetBonePos = (_GetBonePos)(g_BaseAddress + OFF_BonePos);
+        }
     });
 }
 
-// 2. Force Load Menu Window for Non-Jailbreak / ESign / TrollStore
 __attribute__((constructor))
 static void forceLoadMenuInEsign() {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         UIWindow *window = nil;
         if (@available(iOS 13.0, *)) {
             for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
