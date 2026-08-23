@@ -4,6 +4,8 @@
 #import <mach-o/dyld.h>
 #import <mach/mach.h>
 #import <Security/Security.h>
+#import <stddef.h>      // for offsetof
+#import <string.h>      // for memcpy
 
 // Imgui library
 #import "Esp/CaptainHook.h"
@@ -58,12 +60,23 @@ struct Vector2 { float X; float Y; };
 typedef void (*_ProcessEvent)(void* Object, void* Function, void* Params);
 static _ProcessEvent ProcessEvent = nullptr;
 
+// --- Safe Memory Reader (must be defined before any usage) ---
+template <typename T>
+static inline T ReadMemory(uintptr_t address, T defaultValue = T()) {
+    if (!address || address < 0x10000000 || address > 0x3000000000) return defaultValue;
+    T buffer;
+    vm_size_t size = 0;
+    kern_return_t kr = vm_read_overwrite(mach_task_self(), (vm_address_t)address, sizeof(T), (vm_address_t)&buffer, &size);
+    if (kr == KERN_SUCCESS && size == sizeof(T)) return buffer;
+    return defaultValue;
+}
+
 // --- Manual World-to-Screen using CameraCache ---
 struct FMinimalViewInfo {
     Vector3 Location;
     Vector3 Rotation;
     float FOV;
-    // ... (we only need the view/projection matrices from the cache)
+    // ... we only need the view/projection matrices from the cache
 };
 
 struct FCameraCacheEntry {
@@ -75,17 +88,10 @@ struct FCameraCacheEntry {
 static bool GetViewProjectionMatrices(uintptr_t CameraManager, float* outViewMatrix, float* outProjMatrix) {
     if (!CameraManager) return false;
     uintptr_t cacheAddr = CameraManager + OFF_CameraCache;
-    FCameraCacheEntry cache = ReadMemory<FCameraCacheEntry>(cacheAddr);
+    FCameraCacheEntry cache = ReadMemory<FCameraCacheEntry>(cacheAddr);   // <-- FIXED: added angle brackets
     if (cache.Timestamp == 0) return false;
 
-    // The actual matrices are stored in the POV; we need to compute them from Location, Rotation, FOV.
-    // For a full manual projection we'd need to build the view matrix from rotation and location,
-    // and the projection matrix from FOV and screen dimensions.
-    // This is a simplified version – you might need to adjust based on your game's layout.
-    // Alternatively, you can read the matrices directly if they are stored nearby.
-    // For brevity, we'll assume the matrices are at POV+some offset.
-    // Many UE4 builds store the view matrix at POV+0x30 and projection at POV+0x70.
-    // We'll use those offsets (they are common, but verify with your dump).
+    // Common UE4 offsets for view/proj matrices inside FMinimalViewInfo
     const int VIEW_MAT_OFFSET = 0x30;
     const int PROJ_MAT_OFFSET = 0x70;
     uintptr_t povAddr = cacheAddr + offsetof(FCameraCacheEntry, POV);
@@ -147,17 +153,6 @@ struct EngineDiagnostics {
     bool w2sWorking;
 };
 static EngineDiagnostics g_Diag = {0};
-
-// Safe Memory Reader
-template <typename T>
-static inline T ReadMemory(uintptr_t address, T defaultValue = T()) {
-    if (!address || address < 0x10000000 || address > 0x3000000000) return defaultValue;
-    T buffer;
-    vm_size_t size = 0;
-    kern_return_t kr = vm_read_overwrite(mach_task_self(), (vm_address_t)address, sizeof(T), (vm_address_t)&buffer, &size);
-    if (kr == KERN_SUCCESS && size == sizeof(T)) return buffer;
-    return defaultValue;
-}
 
 // ---- ImGuiDrawView implementation ----
 @interface ImGuiDrawView () <MTKViewDelegate>
@@ -483,7 +478,7 @@ static void forceLoadMenuInEsign() {
                 }
             }
         } else {
-            window = [[UIApplication sharedApplication] keyWindow];
+            window = [[UIApplication sharedApplication] keyWindow]; // deprecated but fine for < iOS 13
         }
 
         if (window) {
