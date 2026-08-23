@@ -20,6 +20,7 @@ jobs:
       - name: Compile dylib via Xcode Clang
         run: |
           xcrun -sdk iphoneos clang++ -dynamiclib -arch arm64 \
+          -std=c++11 -stdlib=libc++ \
           -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
           -framework UIKit -framework Foundation -framework CoreGraphics -framework Metal -framework MetalKit \
           -I./IMGUI -I./Esp -I./5Toubun \
