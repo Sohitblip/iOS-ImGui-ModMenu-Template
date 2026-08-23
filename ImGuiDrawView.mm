@@ -79,7 +79,7 @@ struct FCameraCacheEntry {
 
 static bool DetectMatrixOffsets(uintptr_t CameraManager, int& outViewOff, int& outProjOff) {
     if (!CameraManager) return false;
-    uintptr_t cacheAddr = CameraManager + 0x4B0; // OFF_CameraCache (common)
+    uintptr_t cacheAddr = CameraManager + 0x4B0;
     FCameraCacheEntry cache = ReadMemory<FCameraCacheEntry>(cacheAddr);
     if (cache.Timestamp == 0) return false;
     uintptr_t povAddr = cacheAddr + offsetof(FCameraCacheEntry, POV);
@@ -101,13 +101,12 @@ static bool DetectMatrixOffsets(uintptr_t CameraManager, int& outViewOff, int& o
     }
     return false;
 }
-// --------------------------------------------------------------------
 
-// --- Pattern scanning for GNames (look for "None" string) ---
+// --- Pattern scanning for GNames ---
 static uintptr_t FindGNames() {
     const char* pattern = "None";
     size_t len = strlen(pattern);
-    uintptr_t end = g_BaseAddress + 0x1000000; // scan first 16MB
+    uintptr_t end = g_BaseAddress + 0x1000000;
     for (uintptr_t addr = g_BaseAddress; addr < end; ++addr) {
         char buf[5];
         vm_size_t size = 0;
@@ -130,7 +129,6 @@ static uintptr_t FindGNames() {
 static void ScanOffsets() {
     if (!g_BaseAddress) return;
 
-    // 1. Find GWorld
     for (int off = 0; off < 0x1000; off += 4) {
         uintptr_t ptr = ReadMemory<uintptr_t>(g_BaseAddress + off);
         if (ptr > 0x10000000 && ptr < 0x3000000000) {
@@ -254,7 +252,7 @@ static bool show_Diagnostics = true;
 static bool autoScanDone = false;
 static char scanResult[1024] = "Auto‑scan will start shortly...";
 
-// ---- Logging helper (optional) ----
+// ---- Logging helper ----
 static void LogOffsetsToFile() {
     @autoreleasepool {
         NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
@@ -270,9 +268,22 @@ static void LogOffsetsToFile() {
             g_World, g_Controller, g_CameraManager,
             g_ActorArray, g_ActorCount, g_ViewMatOff, g_ProjMatOff];
         [log writeToFile:filePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        NSLog(@"Log saved to: %@", filePath);
     }
 }
+
+// ---- Custom MTKView for Hit-Testing ----
+@interface CustomMTKView : MTKView
+@end
+
+@implementation CustomMTKView
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
+    if (!MenDeal) {
+        return NO;
+    }
+    ImGuiIO& io = ImGui::GetIO();
+    return io.WantCaptureMouse;
+}
+@end
 
 // ---- ImGuiDrawView ----
 @interface ImGuiDrawView () <MTKViewDelegate>
@@ -305,7 +316,7 @@ void _huy(void *instance) { huy(instance); }
 - (void)loadView {
     CGFloat w = [UIApplication sharedApplication].windows[0].rootViewController.view.frame.size.width;
     CGFloat h = [UIApplication sharedApplication].windows[0].rootViewController.view.frame.size.height;
-    self.view = [[MTKView alloc] initWithFrame:CGRectMake(0, 0, w, h)];
+    self.view = [[CustomMTKView alloc] initWithFrame:CGRectMake(0, 0, w, h)];
     self.view.backgroundColor = [UIColor clearColor];
     self.view.opaque = NO;
 }
@@ -317,8 +328,8 @@ void _huy(void *instance) { huy(instance); }
     self.mtkView.clearColor = MTLClearColorMake(0, 0, 0, 0);
     self.mtkView.backgroundColor = [UIColor colorWithRed:0 green:0 blue:0 alpha:0];
     self.mtkView.clipsToBounds = YES;
-    // Touch will be toggled in draw loop
     self.view.userInteractionEnabled = YES;
+    self.view.multipleTouchEnabled = YES;
     
     // Auto-scan after 6 seconds
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -333,7 +344,6 @@ void _huy(void *instance) { huy(instance); }
                      g_World, g_Controller, g_CameraManager,
                      g_ActorArray, g_ActorCount, g_ViewMatOff, g_ProjMatOff);
             LogOffsetsToFile();
-            // Re-scan if missing
             if (!g_GWorld || !g_GNames || !g_GUObjectArray || !g_ActorArray) {
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                     ScanOffsets();
@@ -351,13 +361,37 @@ void _huy(void *instance) { huy(instance); }
     });
 }
 
+#pragma mark - Touch Handling
+
+- (void)updateTouch:(NSSet<UITouch *> *)touches isDown:(BOOL)isDown {
+    UITouch *touch = [touches anyObject];
+    if (!touch) return;
+    
+    CGPoint loc = [touch locationInView:self.view];
+    ImGuiIO& io = ImGui::GetIO();
+    io.MousePos = ImVec2(loc.x, loc.y);
+    io.MouseDown[0] = isDown;
+}
+
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    [self updateTouch:touches isDown:YES];
+}
+
+- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    [self updateTouch:touches isDown:YES];
+}
+
+- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    [self updateTouch:touches isDown:NO];
+}
+
+- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    [self updateTouch:touches isDown:NO];
+}
+
 #pragma mark - MTKViewDelegate
 
 - (void)drawInMTKView:(MTKView*)view {
-    // ----- SIMPLE TOUCH TOGGLE (like before) -----
-    // When menu is open, view captures touches; when closed, view ignores touches (game gets them)
-    [self.view setUserInteractionEnabled:MenDeal];
-
     ImGuiIO& io = ImGui::GetIO();
     io.DisplaySize.x = view.bounds.size.width;
     io.DisplaySize.y = view.bounds.size.height;
@@ -366,8 +400,8 @@ void _huy(void *instance) { huy(instance); }
     io.DeltaTime = 1 / float(view.preferredFramesPerSecond ?: 120);
 
     id<MTLCommandBuffer> commandBuffer = [self.commandQueue commandBuffer];
-
     MTLRenderPassDescriptor* renderPassDescriptor = view.currentRenderPassDescriptor;
+    
     if (renderPassDescriptor != nil) {
         id <MTLRenderCommandEncoder> renderEncoder = [commandBuffer renderCommandEncoderWithDescriptor:renderPassDescriptor];
         [renderEncoder pushDebugGroup:@"ImGui"];
