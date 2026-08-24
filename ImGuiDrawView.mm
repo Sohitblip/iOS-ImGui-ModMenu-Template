@@ -28,28 +28,28 @@
 #define kHeight [UIScreen mainScreen].bounds.size.height
 #define kScale  [UIScreen mainScreen].scale
 
-// --- Static Pointers from Dump ---
+// --- Relative RVA Offsets (Base 0x100000000 Subtracted) ---
 namespace UEPointers {
-    constexpr uintptr_t Names = 0x10ff36cb0;
-    constexpr uintptr_t UObjectArray = 0x10a7f93e0;
-    constexpr uintptr_t ObjObjects = 0x10a7f93f0;
-    constexpr uintptr_t Engine = 0x10aa10ca0;
-    constexpr uintptr_t ProcessEvent = 0x1051afe1c;
+    constexpr uintptr_t Names        = 0xff36cb0;
+    constexpr uintptr_t UObjectArray = 0xa7f93e0;
+    constexpr uintptr_t ObjObjects   = 0xa7f93f0;
+    constexpr uintptr_t Engine       = 0xaa10ca0;
+    constexpr uintptr_t ProcessEvent = 0x51afe1c;
 }
 
-// --- Verified Member Offsets ---
+// --- Verified Member Offsets from Dump ---
 namespace UOffsets {
-    constexpr uintptr_t Engine_GameViewport = 0x810;
-    constexpr uintptr_t Viewport_World = 0x80;
-    constexpr uintptr_t World_PersistentLevel = 0x30;
+    constexpr uintptr_t Engine_GameViewport     = 0x810;
+    constexpr uintptr_t Viewport_World          = 0x80;
+    constexpr uintptr_t World_PersistentLevel   = 0x30;
     constexpr uintptr_t World_OwningGameInstance = 0x470;
-    constexpr uintptr_t Level_Actors = 0xA0;
-    constexpr uintptr_t Level_ActorCount = 0xA8;
+    constexpr uintptr_t Level_Actors            = 0xA0;
+    constexpr uintptr_t Level_ActorCount        = 0xA8;
     constexpr uintptr_t GameInstance_LocalPlayers = 0x38;
-    constexpr uintptr_t Player_Controller = 0x30;
+    constexpr uintptr_t Player_Controller       = 0x30;
     constexpr uintptr_t Controller_CameraManager = 0x4D0;
-    constexpr uintptr_t Actor_RootComponent = 0x208;
-    constexpr uintptr_t RootComp_Location = 0x120;
+    constexpr uintptr_t Actor_RootComponent     = 0x208;
+    constexpr uintptr_t RootComp_Location       = 0x120;
 }
 
 // --- Vector structures ---
@@ -132,42 +132,48 @@ static void InitializePointers() {
     g_GNames = g_BaseAddress + UEPointers::Names;
     g_GUObjectArray = g_BaseAddress + UEPointers::UObjectArray;
 
-    // 1. Base + Engine Offset -> GEngine
+    // 1. Read GEngine using Relative RVA
     g_GEngine = ReadMemory<uintptr_t>(g_BaseAddress + UEPointers::Engine);
-    if (!g_GEngine) return;
+
+    // Fallback if not relocated
+    if (!g_GEngine || g_GEngine < 0x10000000 || g_GEngine > 0x3000000000) {
+        g_GEngine = ReadMemory<uintptr_t>(0x10aa10ca0);
+    }
+
+    if (!g_GEngine || g_GEngine < 0x10000000 || g_GEngine > 0x3000000000) return;
 
     // 2. GEngine + 0x810 -> GameViewport
     uintptr_t gameViewport = ReadMemory<uintptr_t>(g_GEngine + UOffsets::Engine_GameViewport);
-    if (!gameViewport) return;
+    if (!gameViewport || gameViewport < 0x10000000 || gameViewport > 0x3000000000) return;
 
     // 3. GameViewport + 0x80 -> UWorld
     g_GWorld = ReadMemory<uintptr_t>(gameViewport + UOffsets::Viewport_World);
-    if (!g_GWorld) return;
+    if (!g_GWorld || g_GWorld < 0x10000000 || g_GWorld > 0x3000000000) return;
 
     // 4. UWorld + 0x30 -> PersistentLevel -> Actors Array
     uintptr_t persistentLevel = ReadMemory<uintptr_t>(g_GWorld + UOffsets::World_PersistentLevel);
-    if (persistentLevel && IsValidVTable(persistentLevel)) {
+    if (persistentLevel && persistentLevel > 0x10000000) {
         g_ActorArray = ReadMemory<uintptr_t>(persistentLevel + UOffsets::Level_Actors);
         g_ActorCount = ReadMemory<int>(persistentLevel + UOffsets::Level_ActorCount);
     }
 
     // 5. UWorld + 0x470 -> OwningGameInstance -> LocalPlayer -> Controller -> CameraManager
     uintptr_t gameInstance = ReadMemory<uintptr_t>(g_GWorld + UOffsets::World_OwningGameInstance);
-    if (gameInstance && IsValidVTable(gameInstance)) {
+    if (gameInstance && gameInstance > 0x10000000) {
         uintptr_t lpArray = ReadMemory<uintptr_t>(gameInstance + UOffsets::GameInstance_LocalPlayers);
-        if (lpArray) {
+        if (lpArray && lpArray > 0x10000000) {
             uintptr_t lp = ReadMemory<uintptr_t>(lpArray);
-            if (lp && IsValidVTable(lp)) {
+            if (lp && lp > 0x10000000) {
                 g_Controller = ReadMemory<uintptr_t>(lp + UOffsets::Player_Controller);
-                if (g_Controller && IsValidVTable(g_Controller)) {
+                if (g_Controller && g_Controller > 0x10000000) {
                     g_CameraManager = ReadMemory<uintptr_t>(g_Controller + UOffsets::Controller_CameraManager);
                 }
             }
         }
     }
 
-    // 6. Camera Matrix Offsets
-    if (g_CameraManager && IsValidVTable(g_CameraManager)) {
+    // 6. Detect Camera Matrix
+    if (g_CameraManager && g_CameraManager > 0x10000000) {
         int vOff, pOff;
         if (DetectMatrixOffsets(g_CameraManager, vOff, pOff)) {
             g_ViewMatOff = vOff;
@@ -271,7 +277,6 @@ static CGRect g_ImGuiWindowRect = CGRectZero;
     self.view.userInteractionEnabled = YES;
     self.view.multipleTouchEnabled = YES;
 
-    // Initialization trigger
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         InitializePointers();
     });
@@ -303,8 +308,8 @@ static CGRect g_ImGuiWindowRect = CGRectZero;
     io.DisplayFramebufferScale = ImVec2(framebufferScale, framebufferScale);
     io.DeltaTime = 1 / float(view.preferredFramesPerSecond ?: 120);
 
-    // Refresh pointer chain if world cleared
-    if (!g_GWorld || !g_ActorArray) {
+    // Refresh pointer chain if uninitialized or cleared
+    if (!g_GWorld || !g_ActorArray || g_ActorCount <= 0) {
         InitializePointers();
     }
 
@@ -362,7 +367,7 @@ static CGRect g_ImGuiWindowRect = CGRectZero;
                 uintptr_t actor = ReadMemory<uintptr_t>(g_ActorArray + (i * sizeof(uintptr_t)));
                 if (!actor || !IsValidVTable(actor)) continue;
 
-                // Exact RootComponent offset from dump (0x208)
+                // RootComponent Offset
                 uintptr_t rootComp = ReadMemory<uintptr_t>(actor + UOffsets::Actor_RootComponent);
                 if (!rootComp || !IsValidVTable(rootComp)) continue;
 
