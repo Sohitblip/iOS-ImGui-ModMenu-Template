@@ -7,6 +7,7 @@
 #import <stddef.h>
 #import <string.h>
 #import <vector>
+#import <cmath>
 
 // Imgui library
 #import "Esp/CaptainHook.h"
@@ -27,16 +28,40 @@
 #define kHeight [UIScreen mainScreen].bounds.size.height
 #define kScale  [UIScreen mainScreen].scale
 
+// --- Static Pointers from Dump ---
+namespace UEPointers {
+    constexpr uintptr_t Names = 0x10ff36cb0;
+    constexpr uintptr_t UObjectArray = 0x10a7f93e0;
+    constexpr uintptr_t ObjObjects = 0x10a7f93f0;
+    constexpr uintptr_t Engine = 0x10aa10ca0;
+    constexpr uintptr_t ProcessEvent = 0x1051afe1c;
+}
+
+// --- Verified Member Offsets ---
+namespace UOffsets {
+    constexpr uintptr_t Engine_GameViewport = 0x810;
+    constexpr uintptr_t Viewport_World = 0x80;
+    constexpr uintptr_t World_PersistentLevel = 0x30;
+    constexpr uintptr_t World_OwningGameInstance = 0x470;
+    constexpr uintptr_t Level_Actors = 0xA0;
+    constexpr uintptr_t Level_ActorCount = 0xA8;
+    constexpr uintptr_t GameInstance_LocalPlayers = 0x38;
+    constexpr uintptr_t Player_Controller = 0x30;
+    constexpr uintptr_t Controller_CameraManager = 0x4D0;
+    constexpr uintptr_t Actor_RootComponent = 0x208;
+    constexpr uintptr_t RootComp_Location = 0x120;
+}
+
 // --- Vector structures ---
 struct Vector3 { float X, Y, Z; };
 struct Vector2 { float X, Y; };
 
-// --- Global addresses (updated by scanner) ---
+// --- Global Addresses & State ---
 static uintptr_t g_BaseAddress = 0;
+static uintptr_t g_GEngine = 0;
 static uintptr_t g_GWorld = 0;
 static uintptr_t g_GNames = 0;
 static uintptr_t g_GUObjectArray = 0;
-static uintptr_t g_World = 0;
 static uintptr_t g_Controller = 0;
 static uintptr_t g_CameraManager = 0;
 static uintptr_t g_ActorArray = 0;
@@ -63,9 +88,7 @@ static bool IsValidVTable(uintptr_t obj) {
     return true;
 }
 
-// --------------------------------------------------------------------
-// Matrix detection functions
-// --------------------------------------------------------------------
+// --- Matrix Detection Structures ---
 struct FMinimalViewInfo {
     Vector3 Location;
     Vector3 Rotation;
@@ -83,17 +106,17 @@ static bool DetectMatrixOffsets(uintptr_t CameraManager, int& outViewOff, int& o
     FCameraCacheEntry cache = ReadMemory<FCameraCacheEntry>(cacheAddr);
     if (cache.Timestamp == 0) return false;
     uintptr_t povAddr = cacheAddr + offsetof(FCameraCacheEntry, POV);
-    int candidates[] = {0x10,0x20,0x30,0x40,0x50,0x60,0x70,0x80,0x90,0xA0,0xB0,0xC0};
+    int candidates[] = {0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xA0, 0xB0, 0xC0};
     for (int vOff : candidates) {
         for (int pOff : candidates) {
             if (vOff == pOff) continue;
             float view[16], proj[16];
-            memcpy(view, (void*)(povAddr + vOff), 16*sizeof(float));
-            memcpy(proj, (void*)(povAddr + pOff), 16*sizeof(float));
-            float sum = 0; for (int i=0;i<16;i++) sum += fabsf(view[i]);
-            if (sum < 0.1f) continue;
-            sum = 0; for (int i=0;i<16;i++) sum += fabsf(proj[i]);
-            if (sum < 0.1f) continue;
+            memcpy(view, (void*)(povAddr + vOff), 16 * sizeof(float));
+            memcpy(proj, (void*)(povAddr + pOff), 16 * sizeof(float));
+            float sumV = 0; for (int i = 0; i < 16; i++) sumV += fabsf(view[i]);
+            if (sumV < 0.1f) continue;
+            float sumP = 0; for (int i = 0; i < 16; i++) sumP += fabsf(proj[i]);
+            if (sumP < 0.1f) continue;
             outViewOff = vOff;
             outProjOff = pOff;
             return true;
@@ -102,110 +125,49 @@ static bool DetectMatrixOffsets(uintptr_t CameraManager, int& outViewOff, int& o
     return false;
 }
 
-// --- Pattern scanning for GNames ---
-static uintptr_t FindGNames() {
-    const char* pattern = "None";
-    size_t len = strlen(pattern);
-    uintptr_t end = g_BaseAddress + 0x1000000;
-    for (uintptr_t addr = g_BaseAddress; addr < end; ++addr) {
-        char buf[5];
-        vm_size_t size = 0;
-        if (vm_read_overwrite(mach_task_self(), (vm_address_t)addr, len, (vm_address_t)buf, &size) == KERN_SUCCESS && size == len) {
-            if (strncmp(buf, pattern, len) == 0) {
-                for (uintptr_t p = g_BaseAddress; p < g_BaseAddress + 0x1000000; p += 4) {
-                    uintptr_t ptr = ReadMemory<uintptr_t>(p);
-                    if (ptr == addr) {
-                        return p;
-                    }
-                }
-                break;
-            }
-        }
-    }
-    return 0;
-}
-
-// --- Enhanced scanner ---
-static void ScanOffsets() {
+// --- Direct Pointer Resolution ---
+static void InitializePointers() {
     if (!g_BaseAddress) return;
 
-    for (int off = 0; off < 0x1000; off += 4) {
-        uintptr_t ptr = ReadMemory<uintptr_t>(g_BaseAddress + off);
-        if (ptr > 0x10000000 && ptr < 0x3000000000) {
-            if (IsValidVTable(ptr)) {
-                uintptr_t level = ReadMemory<uintptr_t>(ptr + 0x30);
-                if (level > 0x10000000 && IsValidVTable(level)) {
-                    uintptr_t actors = ReadMemory<uintptr_t>(level + 0xA0);
-                    int count = ReadMemory<int>(level + 0xA8);
-                    if (actors > 0x10000000 && count > 0 && count < 5000) {
-                        g_GWorld = ptr;
-                        break;
-                    }
+    g_GNames = g_BaseAddress + UEPointers::Names;
+    g_GUObjectArray = g_BaseAddress + UEPointers::UObjectArray;
+
+    // 1. Base + Engine Offset -> GEngine
+    g_GEngine = ReadMemory<uintptr_t>(g_BaseAddress + UEPointers::Engine);
+    if (!g_GEngine) return;
+
+    // 2. GEngine + 0x810 -> GameViewport
+    uintptr_t gameViewport = ReadMemory<uintptr_t>(g_GEngine + UOffsets::Engine_GameViewport);
+    if (!gameViewport) return;
+
+    // 3. GameViewport + 0x80 -> UWorld
+    g_GWorld = ReadMemory<uintptr_t>(gameViewport + UOffsets::Viewport_World);
+    if (!g_GWorld) return;
+
+    // 4. UWorld + 0x30 -> PersistentLevel -> Actors Array
+    uintptr_t persistentLevel = ReadMemory<uintptr_t>(g_GWorld + UOffsets::World_PersistentLevel);
+    if (persistentLevel && IsValidVTable(persistentLevel)) {
+        g_ActorArray = ReadMemory<uintptr_t>(persistentLevel + UOffsets::Level_Actors);
+        g_ActorCount = ReadMemory<int>(persistentLevel + UOffsets::Level_ActorCount);
+    }
+
+    // 5. UWorld + 0x470 -> OwningGameInstance -> LocalPlayer -> Controller -> CameraManager
+    uintptr_t gameInstance = ReadMemory<uintptr_t>(g_GWorld + UOffsets::World_OwningGameInstance);
+    if (gameInstance && IsValidVTable(gameInstance)) {
+        uintptr_t lpArray = ReadMemory<uintptr_t>(gameInstance + UOffsets::GameInstance_LocalPlayers);
+        if (lpArray) {
+            uintptr_t lp = ReadMemory<uintptr_t>(lpArray);
+            if (lp && IsValidVTable(lp)) {
+                g_Controller = ReadMemory<uintptr_t>(lp + UOffsets::Player_Controller);
+                if (g_Controller && IsValidVTable(g_Controller)) {
+                    g_CameraManager = ReadMemory<uintptr_t>(g_Controller + UOffsets::Controller_CameraManager);
                 }
             }
         }
     }
 
-    if (g_GWorld) {
-        for (int off = 0x20; off < 0x100; off += 4) {
-            uintptr_t gi = ReadMemory<uintptr_t>(g_GWorld + off);
-            if (gi > 0x10000000 && IsValidVTable(gi)) {
-                uintptr_t lpArray = ReadMemory<uintptr_t>(gi + 0x38);
-                if (lpArray > 0x10000000) {
-                    uintptr_t lp = ReadMemory<uintptr_t>(lpArray);
-                    if (lp > 0x10000000 && IsValidVTable(lp)) {
-                        for (int pcOff = 0x20; pcOff < 0x80; pcOff += 4) {
-                            uintptr_t pc = ReadMemory<uintptr_t>(lp + pcOff);
-                            if (pc > 0x10000000 && IsValidVTable(pc)) {
-                                uintptr_t cam = ReadMemory<uintptr_t>(pc + 0x4D0);
-                                if (cam > 0x10000000 && IsValidVTable(cam)) {
-                                    g_Controller = pc;
-                                    g_CameraManager = cam;
-                                    break;
-                                }
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-
-        for (int off = 0x20; off < 0x100; off += 4) {
-            uintptr_t level = ReadMemory<uintptr_t>(g_GWorld + off);
-            if (level > 0x10000000 && IsValidVTable(level)) {
-                uintptr_t actors = ReadMemory<uintptr_t>(level + 0xA0);
-                int count = ReadMemory<int>(level + 0xA8);
-                if (actors > 0x10000000 && count > 0 && count < 5000) {
-                    g_ActorArray = actors;
-                    g_ActorCount = count;
-                    break;
-                }
-            }
-        }
-    }
-
-    if (!g_GNames) {
-        g_GNames = FindGNames();
-    }
-
-    if (!g_GUObjectArray) {
-        for (int off = 0; off < 0x1000000; off += 4) {
-            uintptr_t ptr = ReadMemory<uintptr_t>(g_BaseAddress + off);
-            if (ptr > 0x10000000 && ptr < 0x3000000000) {
-                uintptr_t firstObj = ReadMemory<uintptr_t>(ptr);
-                if (firstObj > 0x10000000 && IsValidVTable(firstObj)) {
-                    uintptr_t classPriv = ReadMemory<uintptr_t>(firstObj + 0x10);
-                    if (classPriv > 0x10000000 && IsValidVTable(classPriv)) {
-                        g_GUObjectArray = ptr;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    if (g_CameraManager) {
+    // 6. Camera Matrix Offsets
+    if (g_CameraManager && IsValidVTable(g_CameraManager)) {
         int vOff, pOff;
         if (DetectMatrixOffsets(g_CameraManager, vOff, pOff)) {
             g_ViewMatOff = vOff;
@@ -214,7 +176,7 @@ static void ScanOffsets() {
     }
 }
 
-// --- W2S ---
+// --- W2S Functions ---
 static bool GetViewProjectionMatrices(uintptr_t CameraManager, float* outViewMatrix, float* outProjMatrix) {
     if (!CameraManager) return false;
     uintptr_t cacheAddr = CameraManager + 0x4B0;
@@ -232,10 +194,12 @@ static bool ProjectWorldToScreen(Vector3 worldPos, Vector2& screenPos, float* vi
     float z = viewMatrix[8]*worldPos.X + viewMatrix[9]*worldPos.Y + viewMatrix[10]*worldPos.Z + viewMatrix[11];
     float w = viewMatrix[12]*worldPos.X + viewMatrix[13]*worldPos.Y + viewMatrix[14]*worldPos.Z + viewMatrix[15];
     if (w < 0.001f) return false;
+
     float clipX = projMatrix[0]*x + projMatrix[1]*y + projMatrix[2]*z + projMatrix[3]*w;
     float clipY = projMatrix[4]*x + projMatrix[5]*y + projMatrix[6]*z + projMatrix[7]*w;
     float clipW = projMatrix[12]*x + projMatrix[13]*y + projMatrix[14]*z + projMatrix[15]*w;
     if (clipW < 0.001f) return false;
+
     float ndcX = clipX / clipW;
     float ndcY = clipY / clipW;
     screenPos.X = (ndcX * 0.5f + 0.5f) * screenWidth;
@@ -243,53 +207,27 @@ static bool ProjectWorldToScreen(Vector3 worldPos, Vector2& screenPos, float* vi
     return true;
 }
 
-// --- UI globals ---
+// --- UI Globals ---
 static bool MenDeal = true;
 static bool show_ESPBox = true;
 static bool show_ESPLine = true;
 static bool show_ESPDistance = true;
 static bool show_Diagnostics = true;
-static bool autoScanDone = false;
-static char scanResult[1024] = "Auto‑scan will start shortly...";
 static CGRect g_ImGuiWindowRect = CGRectZero;
 
-// ---- Logging helper ----
-static void LogOffsetsToFile() {
-    @autoreleasepool {
-        NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-        NSString *docDir = [paths firstObject];
-        NSString *filePath = [docDir stringByAppendingPathComponent:@"offset_log.txt"];
-        NSString *log = [NSString stringWithFormat:
-            @"========= URP OFFSET LOG =========\n"
-            @"Timestamp: %@\n"
-            @"Base: 0x%lx\nGWorld: 0x%lx\nGNames: 0x%lx\nGUObject: 0x%lx\n"
-            @"World: 0x%lx\nController: 0x%lx\nCamMgr: 0x%lx\n"
-            @"ActorArr: 0x%lx\nActorCount: %d\nViewMatOff: 0x%X\nProjMatOff: 0x%X\n\n",
-            [NSDate date], g_BaseAddress, g_GWorld, g_GNames, g_GUObjectArray,
-            g_World, g_Controller, g_CameraManager,
-            g_ActorArray, g_ActorCount, g_ViewMatOff, g_ProjMatOff];
-        [log writeToFile:filePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    }
-}
-
-// ---- Custom MTKView for Hit-Testing ----
+// --- Custom MTKView ---
 @interface CustomMTKView : MTKView
 @end
 
 @implementation CustomMTKView
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
-    if (!MenDeal) {
-        return NO;
-    }
-    // Agar click actual menu box ke andar hai, tabhi view touch capture kare
-    if (CGRectContainsPoint(g_ImGuiWindowRect, point)) {
-        return YES;
-    }
+    if (!MenDeal) return NO;
+    if (CGRectContainsPoint(g_ImGuiWindowRect, point)) return YES;
     return NO;
 }
 @end
 
-// ---- ImGuiDrawView ----
+// --- ImGuiDrawView Implementation ---
 @interface ImGuiDrawView () <MTKViewDelegate>
 @property (nonatomic, strong) id <MTLDevice> device;
 @property (nonatomic, strong) id <MTLCommandQueue> commandQueue;
@@ -297,19 +235,17 @@ static void LogOffsetsToFile() {
 
 @implementation ImGuiDrawView
 
-void (*huy)(void *instance);
-void _huy(void *instance) { huy(instance); }
-
 - (instancetype)initWithNibName:(nullable NSString *)nibNameOrNil bundle:(nullable NSBundle *)nibBundleOrNil {
     self = [super initWithNibName:nibNameOrNil bundle:nibBundleOrNil];
     _device = MTLCreateSystemDefaultDevice();
     _commandQueue = [_device newCommandQueue];
     if (!self.device) abort();
+
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO(); (void)io;
     ImGui::StyleColorsClassic();
-    ImFont* font = io.Fonts->AddFontFromMemoryCompressedTTF((void*)Honkai_compressed_data, Honkai_compressed_size, 45.0f, NULL, io.Fonts->GetGlyphRangesDefault());
+    io.Fonts->AddFontFromMemoryCompressedTTF((void*)Honkai_compressed_data, Honkai_compressed_size, 45.0f, NULL, io.Fonts->GetGlyphRangesDefault());
     ImGui_ImplMetal_Init(_device);
     return self;
 }
@@ -334,34 +270,10 @@ void _huy(void *instance) { huy(instance); }
     self.mtkView.clipsToBounds = YES;
     self.view.userInteractionEnabled = YES;
     self.view.multipleTouchEnabled = YES;
-    
-    // Auto-scan after 6 seconds
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (!autoScanDone) {
-            ScanOffsets();
-            autoScanDone = YES;
-            snprintf(scanResult, sizeof(scanResult),
-                     "GWorld: 0x%lx\nGNames: 0x%lx\nGUObjectArray: 0x%lx\n"
-                     "World: 0x%lx\nController: 0x%lx\nCameraManager: 0x%lx\n"
-                     "ActorArray: 0x%lx\nActorCount: %d\nViewMatOff: 0x%X\nProjMatOff: 0x%X",
-                     g_GWorld, g_GNames, g_GUObjectArray,
-                     g_World, g_Controller, g_CameraManager,
-                     g_ActorArray, g_ActorCount, g_ViewMatOff, g_ProjMatOff);
-            LogOffsetsToFile();
-            if (!g_GWorld || !g_GNames || !g_GUObjectArray || !g_ActorArray) {
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    ScanOffsets();
-                    snprintf(scanResult, sizeof(scanResult),
-                             "GWorld: 0x%lx\nGNames: 0x%lx\nGUObjectArray: 0x%lx\n"
-                             "World: 0x%lx\nController: 0x%lx\nCameraManager: 0x%lx\n"
-                             "ActorArray: 0x%lx\nActorCount: %d\nViewMatOff: 0x%X\nProjMatOff: 0x%X",
-                             g_GWorld, g_GNames, g_GUObjectArray,
-                             g_World, g_Controller, g_CameraManager,
-                             g_ActorArray, g_ActorCount, g_ViewMatOff, g_ProjMatOff);
-                    LogOffsetsToFile();
-                });
-            }
-        }
+
+    // Initialization trigger
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        InitializePointers();
     });
 }
 
@@ -370,30 +282,18 @@ void _huy(void *instance) { huy(instance); }
 - (void)updateTouch:(NSSet<UITouch *> *)touches isDown:(BOOL)isDown {
     UITouch *touch = [touches anyObject];
     if (!touch) return;
-    
     CGPoint loc = [touch locationInView:self.view];
     ImGuiIO& io = ImGui::GetIO();
     io.MousePos = ImVec2(loc.x, loc.y);
     io.MouseDown[0] = isDown;
 }
 
-- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-    [self updateTouch:touches isDown:YES];
-}
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event { [self updateTouch:touches isDown:YES]; }
+- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event { [self updateTouch:touches isDown:YES]; }
+- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event { [self updateTouch:touches isDown:NO]; }
+- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event { [self updateTouch:touches isDown:NO]; }
 
-- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-    [self updateTouch:touches isDown:YES];
-}
-
-- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-    [self updateTouch:touches isDown:NO];
-}
-
-- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-    [self updateTouch:touches isDown:NO];
-}
-
-#pragma mark - MTKViewDelegate
+#pragma mark - Render Loop
 
 - (void)drawInMTKView:(MTKView*)view {
     ImGuiIO& io = ImGui::GetIO();
@@ -403,9 +303,14 @@ void _huy(void *instance) { huy(instance); }
     io.DisplayFramebufferScale = ImVec2(framebufferScale, framebufferScale);
     io.DeltaTime = 1 / float(view.preferredFramesPerSecond ?: 120);
 
+    // Refresh pointer chain if world cleared
+    if (!g_GWorld || !g_ActorArray) {
+        InitializePointers();
+    }
+
     id<MTLCommandBuffer> commandBuffer = [self.commandQueue commandBuffer];
     MTLRenderPassDescriptor* renderPassDescriptor = view.currentRenderPassDescriptor;
-    
+
     if (renderPassDescriptor != nil) {
         id <MTLRenderCommandEncoder> renderEncoder = [commandBuffer renderCommandEncoderWithDescriptor:renderPassDescriptor];
         [renderEncoder pushDebugGroup:@"ImGui"];
@@ -421,21 +326,19 @@ void _huy(void *instance) { huy(instance); }
         ImGui::SetNextWindowPos(ImVec2(x, y), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(ImVec2(400, 350), ImGuiCond_FirstUseEver);
 
-        // --- Menu ---
+        // --- Menu Window ---
         if (MenDeal) {
             ImGui::Begin("URP Overlay", &MenDeal);
-            
-            // Hit-testing frame update
             ImVec2 winPos = ImGui::GetWindowPos();
             ImVec2 winSize = ImGui::GetWindowSize();
             g_ImGuiWindowRect = CGRectMake(winPos.x, winPos.y, winSize.x, winSize.y);
-            
+
             ImGui::Text("Overlay Framework Active");
             ImGui::Separator();
             ImGui::Checkbox("Player 2D Box", &show_ESPBox);
             ImGui::Checkbox("Player Snaplines", &show_ESPLine);
             ImGui::Checkbox("Player Distance", &show_ESPDistance);
-            ImGui::Checkbox("Show Offset Inspector", &show_Diagnostics);
+            ImGui::Checkbox("Show Diagnostics", &show_Diagnostics);
             ImGui::Separator();
             ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
             ImGui::End();
@@ -457,69 +360,65 @@ void _huy(void *instance) { huy(instance); }
         if (g_ActorArray && g_ActorCount > 0 && g_Controller && w2sReady) {
             for (int i = 0; i < g_ActorCount; i++) {
                 uintptr_t actor = ReadMemory<uintptr_t>(g_ActorArray + (i * sizeof(uintptr_t)));
-                if (!actor) continue;
-                uintptr_t rootOffsets[] = {0x140, 0x130, 0x138, 0x148, 0x180};
-                uintptr_t rootComp = 0;
-                for (int r = 0; r < 5; r++) {
-                    rootComp = ReadMemory<uintptr_t>(actor + rootOffsets[r]);
-                    if (rootComp > 0x10000000 && IsValidVTable(rootComp)) break;
-                }
-                if (!rootComp) continue;
-                Vector3 actorPos = ReadMemory<Vector3>(rootComp + 0x120);
+                if (!actor || !IsValidVTable(actor)) continue;
+
+                // Exact RootComponent offset from dump (0x208)
+                uintptr_t rootComp = ReadMemory<uintptr_t>(actor + UOffsets::Actor_RootComponent);
+                if (!rootComp || !IsValidVTable(rootComp)) continue;
+
+                Vector3 actorPos = ReadMemory<Vector3>(rootComp + UOffsets::RootComp_Location);
                 if (actorPos.X == 0 && actorPos.Y == 0 && actorPos.Z == 0) continue;
+
                 Vector3 headPos = actorPos; headPos.Z += 80.0f;
                 Vector3 feetPos = actorPos; feetPos.Z -= 80.0f;
                 Vector2 screenHead, screenFeet, screenPos;
+
                 if (ProjectWorldToScreen(headPos, screenHead, viewMat, projMat, viewWidth, viewHeight) &&
                     ProjectWorldToScreen(feetPos, screenFeet, viewMat, projMat, viewWidth, viewHeight) &&
                     ProjectWorldToScreen(actorPos, screenPos, viewMat, projMat, viewWidth, viewHeight)) {
+
                     float boxHeight = fabsf(screenFeet.Y - screenHead.Y);
                     float boxWidth = boxHeight / 2.0f;
                     float boxLeft = screenHead.X - (boxWidth / 2.0f);
+
                     if (show_ESPLine) {
-                        drawList->AddLine(ImVec2(viewWidth/2, 60), ImVec2(screenHead.X, screenHead.Y), IM_COL32(255,235,59,255), 1.5f);
+                        drawList->AddLine(ImVec2(viewWidth / 2, 60), ImVec2(screenHead.X, screenHead.Y), IM_COL32(255, 235, 59, 255), 1.5f);
                     }
                     if (show_ESPBox) {
-                        drawList->AddRect(ImVec2(boxLeft, screenHead.Y), ImVec2(boxLeft+boxWidth, screenFeet.Y), IM_COL32(255,40,40,255), 0.0f, 0, 1.6f);
+                        drawList->AddRect(ImVec2(boxLeft, screenHead.Y), ImVec2(boxLeft + boxWidth, screenFeet.Y), IM_COL32(255, 40, 40, 255), 0.0f, 0, 1.6f);
                     }
                     if (show_ESPDistance) {
-                        float dist = sqrtf(actorPos.X*actorPos.X + actorPos.Y*actorPos.Y + actorPos.Z*actorPos.Z) / 100.0f;
-                        char txt[32]; snprintf(txt, sizeof(txt), "%.1fm", dist);
-                        drawList->AddText(ImVec2(screenHead.X-10, screenHead.Y-20), IM_COL32(255,255,255,255), txt);
+                        float dist = sqrtf(actorPos.X * actorPos.X + actorPos.Y * actorPos.Y + actorPos.Z * actorPos.Z) / 100.0f;
+                        char txt[32]; 
+                        snprintf(txt, sizeof(txt), "%.1fm", dist);
+                        drawList->AddText(ImVec2(screenHead.X - 10, screenHead.Y - 20), IM_COL32(255, 255, 255, 255), txt);
                     }
                 }
             }
         }
 
-        // --- Diagnostics Overlay ---
+        // --- Diagnostics Window ---
         if (show_Diagnostics) {
-            char debugText[1024];
+            char debugText[512];
             snprintf(debugText, sizeof(debugText),
-                     "[Engine Inspector]\n"
+                     "[Engine Diagnostics]\n"
                      "Base: 0x%lx\n"
+                     "GEngine: 0x%lx\n"
                      "GWorld: 0x%lx\n"
-                     "GNames: 0x%lx\n"
-                     "GUObject: 0x%lx\n"
-                     "World: 0x%lx\n"
                      "Controller: 0x%lx\n"
                      "CamMgr: 0x%lx\n"
                      "ActorArr: 0x%lx\n"
                      "ActorCount: %d\n"
-                     "ViewMatOff: 0x%X\n"
-                     "ProjMatOff: 0x%X\n"
-                     "--- Scan Result ---\n%s",
-                     g_BaseAddress,
-                     g_GWorld, g_GNames, g_GUObjectArray,
-                     g_World, g_Controller, g_CameraManager,
-                     g_ActorArray, g_ActorCount,
-                     g_ViewMatOff, g_ProjMatOff,
-                     scanResult);
-            drawList->AddRectFilled(ImVec2(20,40), ImVec2(380, 320), IM_COL32(10,15,25,210), 6.0f);
-            drawList->AddRect(ImVec2(20,40), ImVec2(380, 320), IM_COL32(0,255,200,180), 6.0f);
-            drawList->AddText(ImVec2(28,46), IM_COL32(255,255,255,255), debugText);
+                     "ViewMat: 0x%X | ProjMat: 0x%X",
+                     g_BaseAddress, g_GEngine, g_GWorld, g_Controller,
+                     g_CameraManager, g_ActorArray, g_ActorCount,
+                     g_ViewMatOff, g_ProjMatOff);
+
+            drawList->AddRectFilled(ImVec2(20, 40), ImVec2(340, 230), IM_COL32(10, 15, 25, 210), 6.0f);
+            drawList->AddRect(ImVec2(20, 40), ImVec2(340, 230), IM_COL32(0, 255, 200, 180), 6.0f);
+            drawList->AddText(ImVec2(28, 46), IM_COL32(255, 255, 255, 255), debugText);
         }
 
-        // --- Render ImGui ---
         ImGui::Render();
         ImDrawData* draw_data = ImGui::GetDrawData();
         ImGui_ImplMetal_RenderDrawData(draw_data, commandBuffer, renderEncoder);
@@ -542,7 +441,7 @@ void _huy(void *instance) { huy(instance); }
 
 __attribute__((constructor))
 static void initialize() {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         g_BaseAddress = (uintptr_t)_dyld_get_image_header(0);
     });
 }
