@@ -153,11 +153,15 @@ static void InitializePointers() {
     g_GWorld = ReadMemory<uintptr_t>(gameViewport + UOffsets::Viewport_World);
     if (!g_GWorld || g_GWorld < 0x10000000 || g_GWorld > 0x3000000000) return;
 
-    // 4. UWorld + 0x30 -> PersistentLevel -> Actors Array
+    // 4. PersistentLevel -> ActorCluster (0xE0) -> Actors (0x28)
     uintptr_t persistentLevel = ReadMemory<uintptr_t>(g_GWorld + UOffsets::World_PersistentLevel);
     if (persistentLevel && persistentLevel > 0x10000000) {
-        g_ActorArray = ReadMemory<uintptr_t>(persistentLevel + UOffsets::Level_Actors);
-        g_ActorCount = ReadMemory<int>(persistentLevel + UOffsets::Level_ActorCount);
+        uintptr_t actorCluster = ReadMemory<uintptr_t>(persistentLevel + UOffsets::Level_ActorCluster);
+        if (actorCluster && actorCluster > 0x10000000) {
+            // TArray layout: [0x0: Data Pointer, 0x8: Count]
+            g_ActorArray = ReadMemory<uintptr_t>(actorCluster + UOffsets::Cluster_Actors);
+            g_ActorCount = ReadMemory<int>(actorCluster + UOffsets::Cluster_Actors + 0x8);
+        }
     }
 
     // 5. UWorld + 0x470 -> OwningGameInstance -> LocalPlayer -> Controller -> CameraManager
