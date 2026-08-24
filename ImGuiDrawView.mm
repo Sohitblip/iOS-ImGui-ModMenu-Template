@@ -44,11 +44,13 @@ namespace UOffsets {
     constexpr uintptr_t World_PersistentLevel    = 0x30;
     constexpr uintptr_t World_OwningGameInstance  = 0x470;
     
-    // Updated from Dump (ActorCluster -> Actors)
+    // Level -> Actors array
+    constexpr uintptr_t Level_Actors             = 0x98; // Dump ke according agar Actors direct level mein hai
     constexpr uintptr_t Level_ActorCluster       = 0xE0;
     constexpr uintptr_t Cluster_Actors           = 0x28;
     
-    constexpr uintptr_t GameInstance_LocalPlayers = 0x38;
+    // LocalPlayers from Dump
+    constexpr uintptr_t GameInstance_LocalPlayers = 0x48;
     constexpr uintptr_t Player_Controller        = 0x30;
     constexpr uintptr_t Controller_CameraManager  = 0x4D0;
     constexpr uintptr_t Actor_RootComponent      = 0x208;
@@ -128,43 +130,41 @@ static bool DetectMatrixOffsets(uintptr_t CameraManager, int& outViewOff, int& o
     return false;
 }
 
-// --- Direct Pointer Resolution ---
+// --- Simplified Pointer Resolution ---
 static void InitializePointers() {
     if (!g_BaseAddress) return;
 
-    g_GNames = g_BaseAddress + UEPointers::Names;
-    g_GUObjectArray = g_BaseAddress + UEPointers::UObjectArray;
-
-    // 1. Read GEngine using Relative RVA
+    // 1. GEngine
     g_GEngine = ReadMemory<uintptr_t>(g_BaseAddress + UEPointers::Engine);
+    if (!g_GEngine) g_GEngine = ReadMemory<uintptr_t>(0x10aa10ca0);
+    if (!g_GEngine || g_GEngine < 0x10000000) return;
 
-    // Fallback if not relocated
-    if (!g_GEngine || g_GEngine < 0x10000000 || g_GEngine > 0x3000000000) {
-        g_GEngine = ReadMemory<uintptr_t>(0x10aa10ca0);
-    }
-
-    if (!g_GEngine || g_GEngine < 0x10000000 || g_GEngine > 0x3000000000) return;
-
-    // 2. GEngine + 0x810 -> GameViewport
+    // 2. GameViewport
     uintptr_t gameViewport = ReadMemory<uintptr_t>(g_GEngine + UOffsets::Engine_GameViewport);
-    if (!gameViewport || gameViewport < 0x10000000 || gameViewport > 0x3000000000) return;
+    if (!gameViewport || gameViewport < 0x10000000) return;
 
-    // 3. GameViewport + 0x80 -> UWorld
+    // 3. UWorld
     g_GWorld = ReadMemory<uintptr_t>(gameViewport + UOffsets::Viewport_World);
-    if (!g_GWorld || g_GWorld < 0x10000000 || g_GWorld > 0x3000000000) return;
+    if (!g_GWorld || g_GWorld < 0x10000000) return;
 
-    // 4. PersistentLevel -> ActorCluster (0xE0) -> Actors (0x28)
+    // 4. PersistentLevel -> Actors (Fallback to Cluster if needed)
     uintptr_t persistentLevel = ReadMemory<uintptr_t>(g_GWorld + UOffsets::World_PersistentLevel);
     if (persistentLevel && persistentLevel > 0x10000000) {
-        uintptr_t actorCluster = ReadMemory<uintptr_t>(persistentLevel + UOffsets::Level_ActorCluster);
-        if (actorCluster && actorCluster > 0x10000000) {
-            // TArray layout: [0x0: Data Pointer, 0x8: Count]
-            g_ActorArray = ReadMemory<uintptr_t>(actorCluster + UOffsets::Cluster_Actors);
-            g_ActorCount = ReadMemory<int>(actorCluster + UOffsets::Cluster_Actors + 0x8);
+        // Direct Level_Actors read
+        g_ActorArray = ReadMemory<uintptr_t>(persistentLevel + UOffsets::Level_Actors);
+        g_ActorCount = ReadMemory<int>(persistentLevel + UOffsets::Level_Actors + 0x8);
+
+        // Fallback to ActorCluster structure if Level_Actors count is empty
+        if (!g_ActorArray || g_ActorCount <= 0) {
+            uintptr_t actorCluster = ReadMemory<uintptr_t>(persistentLevel + UOffsets::Level_ActorCluster);
+            if (actorCluster && actorCluster > 0x10000000) {
+                g_ActorArray = ReadMemory<uintptr_t>(actorCluster + UOffsets::Cluster_Actors);
+                g_ActorCount = ReadMemory<int>(actorCluster + UOffsets::Cluster_Actors + 0x8);
+            }
         }
     }
 
-    // 5. UWorld + 0x470 -> OwningGameInstance -> LocalPlayer -> Controller -> CameraManager
+    // 5. GameInstance -> LocalPlayer -> Controller -> CameraManager
     uintptr_t gameInstance = ReadMemory<uintptr_t>(g_GWorld + UOffsets::World_OwningGameInstance);
     if (gameInstance && gameInstance > 0x10000000) {
         uintptr_t lpArray = ReadMemory<uintptr_t>(gameInstance + UOffsets::GameInstance_LocalPlayers);
@@ -179,7 +179,7 @@ static void InitializePointers() {
         }
     }
 
-    // 6. Detect Camera Matrix
+    // 6. Camera Matrix Setup
     if (g_CameraManager && g_CameraManager > 0x10000000) {
         int vOff, pOff;
         if (DetectMatrixOffsets(g_CameraManager, vOff, pOff)) {
