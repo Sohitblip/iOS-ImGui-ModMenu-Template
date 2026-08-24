@@ -39,17 +39,20 @@ namespace UEPointers {
 
 // --- Verified Member Offsets from Dump ---
 namespace UOffsets {
-    constexpr uintptr_t Engine_GameViewport     = 0x810;
-    constexpr uintptr_t Viewport_World          = 0x80;
-    constexpr uintptr_t World_PersistentLevel   = 0x30;
-    constexpr uintptr_t World_OwningGameInstance = 0x470;
-    constexpr uintptr_t Level_Actors            = 0xA0;
-    constexpr uintptr_t Level_ActorCount        = 0xA8;
+    constexpr uintptr_t Engine_GameViewport      = 0x810;
+    constexpr uintptr_t Viewport_World           = 0x80;
+    constexpr uintptr_t World_PersistentLevel    = 0x30;
+    constexpr uintptr_t World_OwningGameInstance  = 0x470;
+    
+    // Updated from Dump (ActorCluster -> Actors)
+    constexpr uintptr_t Level_ActorCluster       = 0xE0;
+    constexpr uintptr_t Cluster_Actors           = 0x28;
+    
     constexpr uintptr_t GameInstance_LocalPlayers = 0x38;
-    constexpr uintptr_t Player_Controller       = 0x30;
-    constexpr uintptr_t Controller_CameraManager = 0x4D0;
-    constexpr uintptr_t Actor_RootComponent     = 0x208;
-    constexpr uintptr_t RootComp_Location       = 0x120;
+    constexpr uintptr_t Player_Controller        = 0x30;
+    constexpr uintptr_t Controller_CameraManager  = 0x4D0;
+    constexpr uintptr_t Actor_RootComponent      = 0x208;
+    constexpr uintptr_t RootComp_Location        = 0x120;
 }
 
 // --- Vector structures ---
