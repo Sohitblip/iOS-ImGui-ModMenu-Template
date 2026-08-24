@@ -42,24 +42,34 @@ namespace UOffsets {
     constexpr uintptr_t Engine_GameViewport      = 0x810;
     constexpr uintptr_t Viewport_World           = 0x80;
     constexpr uintptr_t World_PersistentLevel    = 0x30;
-    constexpr uintptr_t World_OwningGameInstance  = 0x470;
+    constexpr uintptr_t World_OwningGameInstance = 0x470;
     
     // Level -> Actors array
-    constexpr uintptr_t Level_Actors             = 0x98; // Dump ke according agar Actors direct level mein hai
+    constexpr uintptr_t Level_Actors             = 0x98;
     constexpr uintptr_t Level_ActorCluster       = 0xE0;
     constexpr uintptr_t Cluster_Actors           = 0x28;
     
     // LocalPlayers from Dump
     constexpr uintptr_t GameInstance_LocalPlayers = 0x48;
     constexpr uintptr_t Player_Controller        = 0x30;
-    constexpr uintptr_t Controller_CameraManager  = 0x4D0;
+    constexpr uintptr_t Controller_CameraManager = 0x4D0;
     constexpr uintptr_t Actor_RootComponent      = 0x208;
     constexpr uintptr_t RootComp_Location        = 0x120;
+    constexpr uintptr_t Character_Mesh           = 0x4D8;
+    constexpr uintptr_t Pawn_Controller          = 0x4B8;
+    constexpr uintptr_t Actor_Class              = 0x8;      // UObject::ClassPrivate
+    constexpr uintptr_t Class_NameIndex          = 0x18;     // UClass::NamePrivate
+    constexpr uintptr_t Name_ComparisonIndex     = 0x0;      // FName::ComparisonIndex
 }
 
 // --- Vector structures ---
 struct Vector3 { float X, Y, Z; };
 struct Vector2 { float X, Y; };
+
+// --- Matrix structure for safe reading ---
+struct FMatrix16 {
+    float M[16];
+};
 
 // --- Global Addresses & State ---
 static uintptr_t g_BaseAddress = 0;
@@ -73,11 +83,13 @@ static uintptr_t g_ActorArray = 0;
 static int g_ActorCount = 0;
 static int g_ViewMatOff = 0x30;
 static int g_ProjMatOff = 0x70;
+static Vector3 g_LocalPlayerPos = {0, 0, 0};
+static uintptr_t g_LocalPawn = 0;
 
 // --- Safe Memory Reader ---
 template <typename T>
 static inline T ReadMemory(uintptr_t address, T defaultValue = T()) {
-    if (!address || address < 0x10000000 || address > 0x3000000000) return defaultValue;
+    if (!address || address < 0x10000000 || address > 0x3000000000ULL) return defaultValue;
     T buffer;
     vm_size_t size = 0;
     kern_return_t kr = vm_read_overwrite(mach_task_self(), (vm_address_t)address, sizeof(T), (vm_address_t)&buffer, &size);
@@ -85,12 +97,115 @@ static inline T ReadMemory(uintptr_t address, T defaultValue = T()) {
     return defaultValue;
 }
 
-// --- VTable validation ---
+// --- VTable validation with expanded window ---
 static bool IsValidVTable(uintptr_t obj) {
-    if (!obj || obj < 0x10000000 || obj > 0x3000000000) return false;
+    if (!obj || obj < 0x10000000 || obj > 0x3000000000ULL) return false;
     uintptr_t vtable = ReadMemory<uintptr_t>(obj);
-    if (!vtable || vtable < g_BaseAddress || vtable > g_BaseAddress + 0x10000000) return false;
+    if (!vtable || vtable < g_BaseAddress || vtable > g_BaseAddress + 0x30000000) return false;
     return true;
+}
+
+// --- Actor Class Name Extraction (for filtering) ---
+static uint32_t GetActorClassIndex(uintptr_t Actor) {
+    uintptr_t classPtr = ReadMemory<uintptr_t>(Actor + UOffsets::Actor_Class);
+    if (!classPtr || classPtr < 0x10000000) return 0;
+    uintptr_t namePtr = ReadMemory<uintptr_t>(classPtr + UOffsets::Class_NameIndex);
+    if (!namePtr || namePtr < 0x10000000) return 0;
+    return ReadMemory<uint32_t>(namePtr + UOffsets::Name_ComparisonIndex);
+}
+
+// --- Get FName string from index (simplified) ---
+static std::string GetNameFromIndex(uint32_t nameIndex) {
+    if (!g_GNames || nameIndex == 0) return "Unknown";
+    
+    // GNames is a TArray of FNameEntry*
+    uintptr_t namesData = ReadMemory<uintptr_t>(g_GNames);
+    if (!namesData) return "Unknown";
+    
+    uintptr_t entryPtr = ReadMemory<uintptr_t>(namesData + (nameIndex * sizeof(uintptr_t)));
+    if (!entryPtr) return "Unknown";
+    
+    // FNameEntry structure: int32_t Len; char Name[...];
+    int32_t len = ReadMemory<int32_t>(entryPtr);
+    if (len <= 0 || len > 128) return "Unknown";
+    
+    char name[128] = {0};
+    for (int i = 0; i < len && i < 127; i++) {
+        name[i] = ReadMemory<char>(entryPtr + 4 + i);
+    }
+    name[len] = '\0';
+    return std::string(name);
+}
+
+// --- Actor Class Filtering ---
+static bool IsPlayerActor(uintptr_t Actor) {
+    uint32_t classIndex = GetActorClassIndex(Actor);
+    if (classIndex == 0) return false;
+    
+    std::string className = GetNameFromIndex(classIndex);
+    
+    // Whitelist for player/character classes
+    static const char* playerClasses[] = {
+        "Character",
+        "PlayerCharacter",
+        "BP_PlayerCharacter",
+        "PlayerPawn",
+        "HumanoidCharacter",
+        "BP_Humanoid",
+        "ThirdPersonCharacter",
+        "Pawn"
+    };
+    
+    for (const char* playerClass : playerClasses) {
+        if (className.find(playerClass) != std::string::npos) {
+            return true;
+        }
+    }
+    
+    // Filter out known non-player classes
+    static const char* nonPlayerClasses[] = {
+        "Light",
+        "Volume",
+        "ActorComponent",
+        "PrimitiveComponent",
+        "PhysicsVolume",
+        "Brush",
+        "StaticMeshActor",
+        "TriggerBase",
+        "BlockingVolume",
+        "SkeletalMeshActor",
+        "CameraActor",
+        "PlayerStart",
+        "NavigationData",
+        "GameState",
+        "GameMode",
+        "PlayerState",
+        "Controller"
+    };
+    
+    for (const char* nonPlayerClass : nonPlayerClasses) {
+        if (className.find(nonPlayerClass) != std::string::npos) {
+            return false;
+        }
+    }
+    
+    // Additional validation: check for CharacterMovement component
+    uintptr_t movement = ReadMemory<uintptr_t>(Actor + 0x2F8); // CharacterMovement (common offset)
+    if (movement && movement > 0x10000000) {
+        uintptr_t movementVtable = ReadMemory<uintptr_t>(movement);
+        if (movementVtable && movementVtable > g_BaseAddress) {
+            return true;
+        }
+    }
+    
+    // Fallback: accept if it has a Mesh component and RootComponent
+    uintptr_t mesh = ReadMemory<uintptr_t>(Actor + UOffsets::Character_Mesh);
+    uintptr_t rootComp = ReadMemory<uintptr_t>(Actor + UOffsets::Actor_RootComponent);
+    if (mesh && mesh > 0x10000000 && rootComp && rootComp > 0x10000000) {
+        return true;
+    }
+    
+    return false;
 }
 
 // --- Matrix Detection Structures ---
@@ -105,23 +220,30 @@ struct FCameraCacheEntry {
     FMinimalViewInfo POV;
 };
 
+// --- Safe matrix detection using FMatrix16 ---
 static bool DetectMatrixOffsets(uintptr_t CameraManager, int& outViewOff, int& outProjOff) {
     if (!CameraManager) return false;
     uintptr_t cacheAddr = CameraManager + 0x4B0;
     FCameraCacheEntry cache = ReadMemory<FCameraCacheEntry>(cacheAddr);
     if (cache.Timestamp == 0) return false;
     uintptr_t povAddr = cacheAddr + offsetof(FCameraCacheEntry, POV);
+    
     int candidates[] = {0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xA0, 0xB0, 0xC0};
     for (int vOff : candidates) {
         for (int pOff : candidates) {
             if (vOff == pOff) continue;
-            float view[16], proj[16];
-            memcpy(view, (void*)(povAddr + vOff), 16 * sizeof(float));
-            memcpy(proj, (void*)(povAddr + pOff), 16 * sizeof(float));
-            float sumV = 0; for (int i = 0; i < 16; i++) sumV += fabsf(view[i]);
+            
+            FMatrix16 viewMat = ReadMemory<FMatrix16>(povAddr + vOff);
+            FMatrix16 projMat = ReadMemory<FMatrix16>(povAddr + pOff);
+            
+            float sumV = 0; 
+            for (int i = 0; i < 16; i++) sumV += fabsf(viewMat.M[i]);
             if (sumV < 0.1f) continue;
-            float sumP = 0; for (int i = 0; i < 16; i++) sumP += fabsf(proj[i]);
+            
+            float sumP = 0; 
+            for (int i = 0; i < 16; i++) sumP += fabsf(projMat.M[i]);
             if (sumP < 0.1f) continue;
+            
             outViewOff = vOff;
             outProjOff = pOff;
             return true;
@@ -130,7 +252,7 @@ static bool DetectMatrixOffsets(uintptr_t CameraManager, int& outViewOff, int& o
     return false;
 }
 
-// --- Simplified Pointer Resolution ---
+// --- Fixed LocalPlayers TArray Extraction ---
 static void InitializePointers() {
     if (!g_BaseAddress) return;
 
@@ -139,15 +261,19 @@ static void InitializePointers() {
     if (!g_GEngine) g_GEngine = ReadMemory<uintptr_t>(0x10aa10ca0);
     if (!g_GEngine || g_GEngine < 0x10000000) return;
 
-    // 2. GameViewport
+    // 2. GNames
+    g_GNames = ReadMemory<uintptr_t>(g_BaseAddress + UEPointers::Names);
+    if (!g_GNames) g_GNames = ReadMemory<uintptr_t>(0x10ff36cb0);
+
+    // 3. GameViewport
     uintptr_t gameViewport = ReadMemory<uintptr_t>(g_GEngine + UOffsets::Engine_GameViewport);
     if (!gameViewport || gameViewport < 0x10000000) return;
 
-    // 3. UWorld
+    // 4. UWorld
     g_GWorld = ReadMemory<uintptr_t>(gameViewport + UOffsets::Viewport_World);
     if (!g_GWorld || g_GWorld < 0x10000000) return;
 
-    // 4. PersistentLevel -> Actors (Fallback to Cluster if needed)
+    // 5. PersistentLevel -> Actors (Fallback to Cluster if needed)
     uintptr_t persistentLevel = ReadMemory<uintptr_t>(g_GWorld + UOffsets::World_PersistentLevel);
     if (persistentLevel && persistentLevel > 0x10000000) {
         // Direct Level_Actors read
@@ -164,22 +290,33 @@ static void InitializePointers() {
         }
     }
 
-    // 5. GameInstance -> LocalPlayer -> Controller -> CameraManager
+    // 6. GameInstance -> LocalPlayer -> Controller -> CameraManager (FIXED TArray parsing)
     uintptr_t gameInstance = ReadMemory<uintptr_t>(g_GWorld + UOffsets::World_OwningGameInstance);
     if (gameInstance && gameInstance > 0x10000000) {
-        uintptr_t lpArray = ReadMemory<uintptr_t>(gameInstance + UOffsets::GameInstance_LocalPlayers);
-        if (lpArray && lpArray > 0x10000000) {
-            uintptr_t lp = ReadMemory<uintptr_t>(lpArray);
+        // Parse LocalPlayers TArray correctly
+        uintptr_t localPlayersArray = ReadMemory<uintptr_t>(gameInstance + UOffsets::GameInstance_LocalPlayers);
+        if (localPlayersArray && localPlayersArray > 0x10000000) {
+            // Get first element of TArray (index 0)
+            uintptr_t lp = ReadMemory<uintptr_t>(localPlayersArray);
             if (lp && lp > 0x10000000) {
                 g_Controller = ReadMemory<uintptr_t>(lp + UOffsets::Player_Controller);
                 if (g_Controller && g_Controller > 0x10000000) {
                     g_CameraManager = ReadMemory<uintptr_t>(g_Controller + UOffsets::Controller_CameraManager);
+                    
+                    // Get local pawn for skip and position
+                    g_LocalPawn = ReadMemory<uintptr_t>(g_Controller + UOffsets::Pawn_Controller);
+                    if (g_LocalPawn && g_LocalPawn > 0x10000000) {
+                        uintptr_t rootComp = ReadMemory<uintptr_t>(g_LocalPawn + UOffsets::Actor_RootComponent);
+                        if (rootComp && rootComp > 0x10000000) {
+                            g_LocalPlayerPos = ReadMemory<Vector3>(rootComp + UOffsets::RootComp_Location);
+                        }
+                    }
                 }
             }
         }
     }
 
-    // 6. Camera Matrix Setup
+    // 7. Camera Matrix Setup
     if (g_CameraManager && g_CameraManager > 0x10000000) {
         int vOff, pOff;
         if (DetectMatrixOffsets(g_CameraManager, vOff, pOff)) {
@@ -189,34 +326,47 @@ static void InitializePointers() {
     }
 }
 
-// --- W2S Functions ---
+// --- Safe W2S Functions using FMatrix16 with proper row-major handling ---
 static bool GetViewProjectionMatrices(uintptr_t CameraManager, float* outViewMatrix, float* outProjMatrix) {
     if (!CameraManager) return false;
     uintptr_t cacheAddr = CameraManager + 0x4B0;
     FCameraCacheEntry cache = ReadMemory<FCameraCacheEntry>(cacheAddr);
     if (cache.Timestamp == 0) return false;
     uintptr_t povAddr = cacheAddr + offsetof(FCameraCacheEntry, POV);
-    memcpy(outViewMatrix, (void*)(povAddr + g_ViewMatOff), 16 * sizeof(float));
-    memcpy(outProjMatrix, (void*)(povAddr + g_ProjMatOff), 16 * sizeof(float));
+    
+    FMatrix16 viewMat = ReadMemory<FMatrix16>(povAddr + g_ViewMatOff);
+    FMatrix16 projMat = ReadMemory<FMatrix16>(povAddr + g_ProjMatOff);
+    
+    // UE uses row-major, Metal uses column-major
+    // Transpose matrices for Metal compatibility
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            outViewMatrix[i * 4 + j] = viewMat.M[j * 4 + i];
+            outProjMatrix[i * 4 + j] = projMat.M[j * 4 + i];
+        }
+    }
     return true;
 }
 
 static bool ProjectWorldToScreen(Vector3 worldPos, Vector2& screenPos, float* viewMatrix, float* projMatrix, int screenWidth, int screenHeight) {
-    float x = viewMatrix[0]*worldPos.X + viewMatrix[1]*worldPos.Y + viewMatrix[2]*worldPos.Z + viewMatrix[3];
-    float y = viewMatrix[4]*worldPos.X + viewMatrix[5]*worldPos.Y + viewMatrix[6]*worldPos.Z + viewMatrix[7];
-    float z = viewMatrix[8]*worldPos.X + viewMatrix[9]*worldPos.Y + viewMatrix[10]*worldPos.Z + viewMatrix[11];
-    float w = viewMatrix[12]*worldPos.X + viewMatrix[13]*worldPos.Y + viewMatrix[14]*worldPos.Z + viewMatrix[15];
+    // Now using column-major matrices for Metal
+    float x = viewMatrix[0] * worldPos.X + viewMatrix[4] * worldPos.Y + viewMatrix[8] * worldPos.Z + viewMatrix[12];
+    float y = viewMatrix[1] * worldPos.X + viewMatrix[5] * worldPos.Y + viewMatrix[9] * worldPos.Z + viewMatrix[13];
+    float z = viewMatrix[2] * worldPos.X + viewMatrix[6] * worldPos.Y + viewMatrix[10] * worldPos.Z + viewMatrix[14];
+    float w = viewMatrix[3] * worldPos.X + viewMatrix[7] * worldPos.Y + viewMatrix[11] * worldPos.Z + viewMatrix[15];
+    
     if (w < 0.001f) return false;
 
-    float clipX = projMatrix[0]*x + projMatrix[1]*y + projMatrix[2]*z + projMatrix[3]*w;
-    float clipY = projMatrix[4]*x + projMatrix[5]*y + projMatrix[6]*z + projMatrix[7]*w;
-    float clipW = projMatrix[12]*x + projMatrix[13]*y + projMatrix[14]*z + projMatrix[15]*w;
+    float clipX = projMatrix[0] * x + projMatrix[4] * y + projMatrix[8] * z + projMatrix[12] * w;
+    float clipY = projMatrix[1] * x + projMatrix[5] * y + projMatrix[9] * z + projMatrix[13] * w;
+    float clipW = projMatrix[3] * x + projMatrix[7] * y + projMatrix[11] * z + projMatrix[15] * w;
+    
     if (clipW < 0.001f) return false;
 
     float ndcX = clipX / clipW;
     float ndcY = clipY / clipW;
     screenPos.X = (ndcX * 0.5f + 0.5f) * screenWidth;
-    screenPos.Y = (-ndcY * 0.5f + 0.5f) * screenHeight;
+    screenPos.Y = (1.0f - (ndcY * 0.5f + 0.5f)) * screenHeight; // Flip Y for screen coordinates
     return true;
 }
 
@@ -353,6 +503,7 @@ static CGRect g_ImGuiWindowRect = CGRectZero;
             ImGui::Checkbox("Show Diagnostics", &show_Diagnostics);
             ImGui::Separator();
             ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
+            ImGui::Text("Actors: %d", g_ActorCount);
             ImGui::End();
         } else {
             g_ImGuiWindowRect = CGRectZero;
@@ -370,9 +521,20 @@ static CGRect g_ImGuiWindowRect = CGRectZero;
         }
 
         if (g_ActorArray && g_ActorCount > 0 && g_Controller && w2sReady) {
+            int playerCount = 0;
             for (int i = 0; i < g_ActorCount; i++) {
                 uintptr_t actor = ReadMemory<uintptr_t>(g_ActorArray + (i * sizeof(uintptr_t)));
                 if (!actor || !IsValidVTable(actor)) continue;
+
+                // Skip if not a player actor
+                if (!IsPlayerActor(actor)) continue;
+
+                // Skip local player
+                if (actor == g_LocalPawn) continue;
+
+                // Additional check: skip if same controller
+                uintptr_t actorController = ReadMemory<uintptr_t>(actor + UOffsets::Pawn_Controller);
+                if (actorController == g_Controller) continue;
 
                 // RootComponent Offset
                 uintptr_t rootComp = ReadMemory<uintptr_t>(actor + UOffsets::Actor_RootComponent);
@@ -381,31 +543,92 @@ static CGRect g_ImGuiWindowRect = CGRectZero;
                 Vector3 actorPos = ReadMemory<Vector3>(rootComp + UOffsets::RootComp_Location);
                 if (actorPos.X == 0 && actorPos.Y == 0 && actorPos.Z == 0) continue;
 
-                Vector3 headPos = actorPos; headPos.Z += 80.0f;
-                Vector3 feetPos = actorPos; feetPos.Z -= 80.0f;
+                // Calculate relative distance
+                float dx = actorPos.X - g_LocalPlayerPos.X;
+                float dy = actorPos.Y - g_LocalPlayerPos.Y;
+                float dz = actorPos.Z - g_LocalPlayerPos.Z;
+                float relativeDistance = sqrtf(dx*dx + dy*dy + dz*dz) / 100.0f;
+
+                // Only draw if within reasonable range
+                if (relativeDistance > 200.0f || relativeDistance < 0.5f) continue;
+
+                // Get mesh for head position
+                uintptr_t mesh = ReadMemory<uintptr_t>(actor + UOffsets::Character_Mesh);
+                Vector3 headPos = actorPos;
+                Vector3 feetPos = actorPos;
+                
+                if (mesh && mesh > 0x10000000) {
+                    // Try to get bone positions
+                    uintptr_t boneArray = ReadMemory<uintptr_t>(mesh + 0x4A0); // USkinnedMeshComponent::BoneSpaceTransforms
+                    if (boneArray && boneArray > 0x10000000) {
+                        // Head bone is usually index 7 or 8
+                        uintptr_t headBone = ReadMemory<uintptr_t>(boneArray + 7 * 0x30); // FTransform size ~0x30
+                        if (headBone && headBone > 0x10000000) {
+                            Vector3 bonePos = ReadMemory<Vector3>(headBone + 0x20); // Translation offset in FTransform
+                            headPos.X = actorPos.X + bonePos.X;
+                            headPos.Y = actorPos.Y + bonePos.Y;
+                            headPos.Z = actorPos.Z + bonePos.Z;
+                        }
+                    }
+                }
+                
+                // Fallback if mesh/bone failed
+                if (headPos.X == actorPos.X && headPos.Y == actorPos.Y && headPos.Z == actorPos.Z) {
+                    headPos.Z += 80.0f;
+                    feetPos.Z -= 80.0f;
+                } else {
+                    feetPos.Z = headPos.Z - 160.0f;
+                }
+
                 Vector2 screenHead, screenFeet, screenPos;
 
                 if (ProjectWorldToScreen(headPos, screenHead, viewMat, projMat, viewWidth, viewHeight) &&
                     ProjectWorldToScreen(feetPos, screenFeet, viewMat, projMat, viewWidth, viewHeight) &&
                     ProjectWorldToScreen(actorPos, screenPos, viewMat, projMat, viewWidth, viewHeight)) {
 
+                    // Check if on screen
+                    if (screenHead.Y < 0 || screenHead.Y > viewHeight || 
+                        screenHead.X < 0 || screenHead.X > viewWidth) continue;
+
                     float boxHeight = fabsf(screenFeet.Y - screenHead.Y);
-                    float boxWidth = boxHeight / 2.0f;
+                    if (boxHeight < 5.0f) continue;
+                    
+                    float boxWidth = boxHeight / 2.5f;
                     float boxLeft = screenHead.X - (boxWidth / 2.0f);
 
+                    // Color based on distance
+                    ImU32 color = IM_COL32(255, 40, 40, 255);
+                    if (relativeDistance < 30.0f) color = IM_COL32(255, 0, 0, 255);
+                    else if (relativeDistance < 60.0f) color = IM_COL32(255, 165, 0, 255);
+                    else if (relativeDistance < 100.0f) color = IM_COL32(255, 255, 0, 255);
+                    else color = IM_COL32(0, 255, 0, 255);
+
                     if (show_ESPLine) {
-                        drawList->AddLine(ImVec2(viewWidth / 2, 60), ImVec2(screenHead.X, screenHead.Y), IM_COL32(255, 235, 59, 255), 1.5f);
+                        drawList->AddLine(ImVec2(viewWidth / 2, viewHeight), 
+                                         ImVec2(screenHead.X, screenHead.Y), 
+                                         color, 1.5f);
                     }
                     if (show_ESPBox) {
-                        drawList->AddRect(ImVec2(boxLeft, screenHead.Y), ImVec2(boxLeft + boxWidth, screenFeet.Y), IM_COL32(255, 40, 40, 255), 0.0f, 0, 1.6f);
+                        drawList->AddRect(ImVec2(boxLeft, screenHead.Y), 
+                                         ImVec2(boxLeft + boxWidth, screenFeet.Y), 
+                                         color, 0.0f, 0, 1.6f);
                     }
                     if (show_ESPDistance) {
-                        float dist = sqrtf(actorPos.X * actorPos.X + actorPos.Y * actorPos.Y + actorPos.Z * actorPos.Z) / 100.0f;
-                        char txt[32]; 
-                        snprintf(txt, sizeof(txt), "%.1fm", dist);
-                        drawList->AddText(ImVec2(screenHead.X - 10, screenHead.Y - 20), IM_COL32(255, 255, 255, 255), txt);
+                        char txt[32];
+                        snprintf(txt, sizeof(txt), "%.1fm", relativeDistance);
+                        txt[sizeof(txt) - 1] = '\0';
+                        drawList->AddText(ImVec2(screenHead.X - 10, screenHead.Y - 20), 
+                                         IM_COL32(255, 255, 255, 255), txt);
                     }
+                    playerCount++;
                 }
+            }
+            
+            // Draw player count
+            if (playerCount > 0) {
+                char countText[64];
+                snprintf(countText, sizeof(countText), "Players: %d", playerCount);
+                drawList->AddText(ImVec2(20, 20), IM_COL32(0, 255, 0, 255), countText);
             }
         }
 
@@ -417,17 +640,23 @@ static CGRect g_ImGuiWindowRect = CGRectZero;
                      "Base: 0x%lx\n"
                      "GEngine: 0x%lx\n"
                      "GWorld: 0x%lx\n"
+                     "GNames: 0x%lx\n"
                      "Controller: 0x%lx\n"
                      "CamMgr: 0x%lx\n"
                      "ActorArr: 0x%lx\n"
                      "ActorCount: %d\n"
-                     "ViewMat: 0x%X | ProjMat: 0x%X",
-                     g_BaseAddress, g_GEngine, g_GWorld, g_Controller,
-                     g_CameraManager, g_ActorArray, g_ActorCount,
-                     g_ViewMatOff, g_ProjMatOff);
+                     "LocalPawn: 0x%lx\n"
+                     "ViewMat: 0x%X | ProjMat: 0x%X\n"
+                     "LocalPos: %.1f, %.1f, %.1f",
+                     g_BaseAddress, g_GEngine, g_GWorld, g_GNames,
+                     g_Controller, g_CameraManager, g_ActorArray, 
+                     g_ActorCount, g_LocalPawn,
+                     g_ViewMatOff, g_ProjMatOff,
+                     g_LocalPlayerPos.X, g_LocalPlayerPos.Y, g_LocalPlayerPos.Z);
+            debugText[sizeof(debugText) - 1] = '\0';
 
-            drawList->AddRectFilled(ImVec2(20, 40), ImVec2(340, 230), IM_COL32(10, 15, 25, 210), 6.0f);
-            drawList->AddRect(ImVec2(20, 40), ImVec2(340, 230), IM_COL32(0, 255, 200, 180), 6.0f);
+            drawList->AddRectFilled(ImVec2(20, 40), ImVec2(340, 260), IM_COL32(10, 15, 25, 210), 6.0f);
+            drawList->AddRect(ImVec2(20, 40), ImVec2(340, 260), IM_COL32(0, 255, 200, 180), 6.0f);
             drawList->AddText(ImVec2(28, 46), IM_COL32(255, 255, 255, 255), debugText);
         }
 
