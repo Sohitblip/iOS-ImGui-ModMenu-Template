@@ -15,7 +15,7 @@
 #import "IMGUI/imgui.h"
 #import "IMGUI/imgui_impl_metal.h"
 #import "IMGUI/Honkai.h"
-#import "Vector.h" // Added for Vector3 support
+#import "Vector.h"
 
 // Patch library
 #import "5Toubun/NakanoIchika.h"
@@ -119,7 +119,6 @@ void RenderPubgLineESP() {
         
         float CurrentDistance = LocalPos.Distance(EnemyPos);
         
-        // Constraint check: Show red line only if distance is up to 50 meters
         if (CurrentDistance > 0.1f && CurrentDistance <= 50.0f) {
             Vector2 ScreenCoordinates;
             if (CustomWorldToScreen(EnemyPos, ActiveMatrix, ScreenWidth, ScreenHeight, ScreenCoordinates)) {
@@ -133,10 +132,6 @@ void RenderPubgLineESP() {
         }
     }
 }
-
-// =========================================================
-// ORIGINAL CODE CONTINUES BELOW
-// =========================================================
 
 // --- Vector structures ---
 struct Vector3_Old { float X, Y, Z; };
@@ -172,7 +167,7 @@ static inline T ReadMemory_Old(uintptr_t address, T defaultValue = T()) {
     return defaultValue;
 }
 
-// --- VTable validation with expanded window ---
+// --- VTable validation ---
 static bool IsValidVTable(uintptr_t obj) {
     if (!obj || obj < 0x10000000 || obj > 0x3000000000ULL) return false;
     uintptr_t vtable = ReadMemory_Old<uintptr_t>(obj);
@@ -218,14 +213,9 @@ static bool IsPlayerActor(uintptr_t Actor) {
     std::string className = GetNameFromIndex(classIndex);
     
     static const char* playerClasses[] = {
-        "Character",
-        "PlayerCharacter",
-        "BP_PlayerCharacter",
-        "PlayerPawn",
-        "HumanoidCharacter",
-        "BP_Humanoid",
-        "ThirdPersonCharacter",
-        "Pawn"
+        "Character", "PlayerCharacter", "BP_PlayerCharacter",
+        "PlayerPawn", "HumanoidCharacter", "BP_Humanoid",
+        "ThirdPersonCharacter", "Pawn"
     };
     
     for (const char* playerClass : playerClasses) {
@@ -235,23 +225,11 @@ static bool IsPlayerActor(uintptr_t Actor) {
     }
     
     static const char* nonPlayerClasses[] = {
-        "Light",
-        "Volume",
-        "ActorComponent",
-        "PrimitiveComponent",
-        "PhysicsVolume",
-        "Brush",
-        "StaticMeshActor",
-        "TriggerBase",
-        "BlockingVolume",
-        "SkeletalMeshActor",
-        "CameraActor",
-        "PlayerStart",
-        "NavigationData",
-        "GameState",
-        "GameMode",
-        "PlayerState",
-        "Controller"
+        "Light", "Volume", "ActorComponent", "PrimitiveComponent",
+        "PhysicsVolume", "Brush", "StaticMeshActor", "TriggerBase",
+        "BlockingVolume", "SkeletalMeshActor", "CameraActor",
+        "PlayerStart", "NavigationData", "GameState", "GameMode",
+        "PlayerState", "Controller"
     };
     
     for (const char* nonPlayerClass : nonPlayerClasses) {
@@ -327,22 +305,17 @@ static void InitializePointers() {
     
     g_Initialized = false;
 
-    // 1. GEngine
     g_GEngine = ReadMemory_Old<uintptr_t>(g_BaseAddress + 0xaa10ca0);
     if (!g_GEngine) return;
 
-    // 2. GNames
     g_GNames = ReadMemory_Old<uintptr_t>(g_BaseAddress + 0xff36cb0);
 
-    // 3. GameViewport
     uintptr_t gameViewport = ReadMemory_Old<uintptr_t>(g_GEngine + 0x810);
     if (!gameViewport || gameViewport < 0x10000000) return;
 
-    // 4. UWorld
     g_GWorld = ReadMemory_Old<uintptr_t>(gameViewport + 0x80);
     if (!g_GWorld || g_GWorld < 0x10000000) return;
 
-    // 5. PersistentLevel -> Actors with dynamic scanning
     uintptr_t persistentLevel = ReadMemory_Old<uintptr_t>(g_GWorld + 0x30);
     if (persistentLevel && persistentLevel > 0x10000000) {
         uintptr_t actorOffsets[] = {0x98, 0xA0, 0xA8, 0xB0, 0xB8, 0xC0};
@@ -369,7 +342,6 @@ static void InitializePointers() {
         }
     }
 
-    // 6. GameInstance with dynamic scanning
     uintptr_t gameInstance = 0;
     uintptr_t instanceOffsets[] = {0x470, 0x1A8, 0x1B0, 0x1B8};
     for (uintptr_t offset : instanceOffsets) {
@@ -407,7 +379,6 @@ static void InitializePointers() {
         }
     }
 
-    // 7. Camera Matrix Setup
     if (g_CameraManager && g_CameraManager > 0x10000000) {
         int vOff, pOff;
         if (DetectMatrixOffsets(g_CameraManager, vOff, pOff)) {
@@ -463,21 +434,29 @@ static bool ProjectWorldToScreen(Vector3_Old worldPos, Vector2_Old& screenPos, f
 }
 
 // --- UI Globals ---
-static bool MenDeal = true;
+static bool MenDeal = true; // Default ON (Force show on startup)
 static bool show_ESPBox = true;
 static bool show_ESPLine = true;
 static bool show_ESPDistance = true;
-static bool show_Diagnostics = true;
+static bool show_Diagnostics = false;
 static CGRect g_ImGuiWindowRect = CGRectZero;
+static CGRect g_ToggleButtonRect = CGRectZero;
 
-// --- Custom MTKView ---
+// --- Custom MTKView with Passthrough ---
 @interface CustomMTKView : MTKView
 @end
 
 @implementation CustomMTKView
 - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
-    if (!MenDeal) return NO;
-    if (CGRectContainsPoint(g_ImGuiWindowRect, point)) return YES;
+    // If touch falls on open menu window, capture it
+    if (MenDeal && CGRectContainsPoint(g_ImGuiWindowRect, point)) {
+        return YES;
+    }
+    // If touch falls on the floating toggle button, capture it
+    if (CGRectContainsPoint(g_ToggleButtonRect, point)) {
+        return YES;
+    }
+    // Otherwise, let the touch pass directly through to the game
     return NO;
 }
 @end
@@ -509,11 +488,13 @@ static CGRect g_ImGuiWindowRect = CGRectZero;
 - (MTKView *)mtkView { return (MTKView *)self.view; }
 
 - (void)loadView {
-    CGFloat w = [UIApplication sharedApplication].windows[0].rootViewController.view.frame.size.width;
-    CGFloat h = [UIApplication sharedApplication].windows[0].rootViewController.view.frame.size.height;
+    CGFloat w = [UIScreen mainScreen].bounds.size.width;
+    CGFloat h = [UIScreen mainScreen].bounds.size.height;
     self.view = [[CustomMTKView alloc] initWithFrame:CGRectMake(0, 0, w, h)];
     self.view.backgroundColor = [UIColor clearColor];
     self.view.opaque = NO;
+    self.view.userInteractionEnabled = YES;
+    self.view.multipleTouchEnabled = YES;
 }
 
 - (void)viewDidLoad {
@@ -523,10 +504,8 @@ static CGRect g_ImGuiWindowRect = CGRectZero;
     self.mtkView.clearColor = MTLClearColorMake(0, 0, 0, 0);
     self.mtkView.backgroundColor = [UIColor colorWithRed:0 green:0 blue:0 alpha:0];
     self.mtkView.clipsToBounds = YES;
-    self.view.userInteractionEnabled = YES;
-    self.view.multipleTouchEnabled = YES;
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         InitializePointers();
     });
 }
@@ -574,19 +553,34 @@ static CGRect g_ImGuiWindowRect = CGRectZero;
         ImFont* font = ImGui::GetFont();
         font->Scale = 15.f / font->FontSize;
 
-        CGFloat x = (view.bounds.size.width - 400) / 2;
-        CGFloat y = (view.bounds.size.height - 350) / 2;
-        ImGui::SetNextWindowPos(ImVec2(x, y), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(400, 350), ImGuiCond_FirstUseEver);
+        // --- Floating Toggle Button (Always accessible to open/close menu) ---
+        ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(100, 45), ImGuiCond_Always);
+        ImGuiWindowFlags btnFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBackground;
+        
+        ImGui::Begin("##ToggleButtonWindow", nullptr, btnFlags);
+        ImVec2 btnPos = ImGui::GetWindowPos();
+        ImVec2 btnSize = ImGui::GetWindowSize();
+        g_ToggleButtonRect = CGRectMake(btnPos.x, btnPos.y, btnSize.x, btnSize.y);
 
-        // --- Menu Window ---
+        if (ImGui::Button(MenDeal ? "Hide Menu" : "Open Menu", ImVec2(90, 35))) {
+            MenDeal = !MenDeal;
+        }
+        ImGui::End();
+
+        // --- Main Menu Window ---
         if (MenDeal) {
+            CGFloat x = (view.bounds.size.width - 400) / 2;
+            CGFloat y = (view.bounds.size.height - 350) / 2;
+            ImGui::SetNextWindowPos(ImVec2(x, y), ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowSize(ImVec2(400, 350), ImGuiCond_FirstUseEver);
+
             ImGui::Begin("URP Overlay", &MenDeal);
             ImVec2 winPos = ImGui::GetWindowPos();
             ImVec2 winSize = ImGui::GetWindowSize();
             g_ImGuiWindowRect = CGRectMake(winPos.x, winPos.y, winSize.x, winSize.y);
 
-            ImGui::Text("Overlay Framework Active");
+            ImGui::Text("Overlay Active");
             ImGui::Separator();
             ImGui::Checkbox("Player 2D Box", &show_ESPBox);
             ImGui::Checkbox("Player Snaplines", &show_ESPLine);
@@ -709,7 +703,7 @@ static CGRect g_ImGuiWindowRect = CGRectZero;
             if (playerCount > 0) {
                 char countText[64];
                 snprintf(countText, sizeof(countText), "Players: %d", playerCount);
-                drawList->AddText(ImVec2(20, 20), IM_COL32(0, 255, 0, 255), countText);
+                drawList->AddText(ImVec2(20, 60), IM_COL32(0, 255, 0, 255), countText);
             }
         }
 
@@ -738,7 +732,6 @@ static CGRect g_ImGuiWindowRect = CGRectZero;
 }
 
 - (void)mtkView:(nonnull MTKView *)view drawableSizeWillChange:(CGSize)size {
-    // Handling resize event
 }
 
 @end
