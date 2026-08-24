@@ -135,10 +135,10 @@ void RenderPubgLineESP() {
 }
 
 // =========================================================
-// ORIGINAL CODE CONTINUES BELOW (with modifications to preserve functionality)
+// ORIGINAL CODE CONTINUES BELOW
 // =========================================================
 
-// --- Vector structures (redefined to match existing code) ---
+// --- Vector structures ---
 struct Vector3_Old { float X, Y, Z; };
 struct Vector2_Old { float X, Y; };
 struct FMatrix16 {
@@ -161,7 +161,7 @@ static Vector3_Old g_LocalPlayerPos = {0, 0, 0};
 static uintptr_t g_LocalPawn = 0;
 static bool g_Initialized = false;
 
-// --- Safe Memory Reader (overloaded to use existing implementation) ---
+// --- Safe Memory Reader ---
 template <typename T>
 static inline T ReadMemory_Old(uintptr_t address, T defaultValue = T()) {
     if (!address || address < 0x10000000 || address > 0x3000000000ULL) return defaultValue;
@@ -180,16 +180,16 @@ static bool IsValidVTable(uintptr_t obj) {
     return true;
 }
 
-// --- Actor Class Name Extraction (for filtering) ---
+// --- Actor Class Name Extraction ---
 static uint32_t GetActorClassIndex(uintptr_t Actor) {
-    uintptr_t classPtr = ReadMemory_Old<uintptr_t>(Actor + 0x8); // Actor_Class
+    uintptr_t classPtr = ReadMemory_Old<uintptr_t>(Actor + 0x8);
     if (!classPtr || classPtr < 0x10000000) return 0;
-    uintptr_t namePtr = ReadMemory_Old<uintptr_t>(classPtr + 0x18); // Class_NameIndex
+    uintptr_t namePtr = ReadMemory_Old<uintptr_t>(classPtr + 0x18);
     if (!namePtr || namePtr < 0x10000000) return 0;
-    return ReadMemory_Old<uint32_t>(namePtr + 0x0); // Name_ComparisonIndex
+    return ReadMemory_Old<uint32_t>(namePtr + 0x0);
 }
 
-// --- Get FName string from index (simplified) ---
+// --- Get FName string from index ---
 static std::string GetNameFromIndex(uint32_t nameIndex) {
     if (!g_GNames || nameIndex == 0) return "Unknown";
     
@@ -268,8 +268,8 @@ static bool IsPlayerActor(uintptr_t Actor) {
         }
     }
     
-    uintptr_t mesh = ReadMemory_Old<uintptr_t>(Actor + 0x4D8); // Character_Mesh
-    uintptr_t rootComp = ReadMemory_Old<uintptr_t>(Actor + 0x208); // Actor_RootComponent
+    uintptr_t mesh = ReadMemory_Old<uintptr_t>(Actor + 0x4D8);
+    uintptr_t rootComp = ReadMemory_Old<uintptr_t>(Actor + 0x208);
     if (mesh && mesh > 0x10000000 && rootComp && rootComp > 0x10000000) {
         return true;
     }
@@ -327,11 +327,11 @@ static void InitializePointers() {
     
     g_Initialized = false;
 
-    // 1. GEngine - using old offsets for compatibility
+    // 1. GEngine
     g_GEngine = ReadMemory_Old<uintptr_t>(g_BaseAddress + 0xaa10ca0);
     if (!g_GEngine) return;
 
-    // 2. GNames - using old offsets for compatibility
+    // 2. GNames
     g_GNames = ReadMemory_Old<uintptr_t>(g_BaseAddress + 0xff36cb0);
 
     // 3. GameViewport
@@ -345,7 +345,6 @@ static void InitializePointers() {
     // 5. PersistentLevel -> Actors with dynamic scanning
     uintptr_t persistentLevel = ReadMemory_Old<uintptr_t>(g_GWorld + 0x30);
     if (persistentLevel && persistentLevel > 0x10000000) {
-        // Scan multiple offsets for Level_Actors
         uintptr_t actorOffsets[] = {0x98, 0xA0, 0xA8, 0xB0, 0xB8, 0xC0};
         for (uintptr_t offset : actorOffsets) {
             g_ActorArray = ReadMemory_Old<uintptr_t>(persistentLevel + offset);
@@ -355,7 +354,6 @@ static void InitializePointers() {
             }
         }
         
-        // Fallback to ActorCluster with dynamic scanning
         if (!g_ActorArray || g_ActorCount <= 0) {
             uintptr_t clusterOffsets[] = {0xE0, 0xF8, 0x100, 0xA8};
             for (uintptr_t offset : clusterOffsets) {
@@ -382,13 +380,10 @@ static void InitializePointers() {
     }
     
     if (gameInstance && gameInstance > 0x10000000) {
-        // Parse LocalPlayers TArray correctly
         uintptr_t localPlayersArray = ReadMemory_Old<uintptr_t>(gameInstance + 0x48);
         if (localPlayersArray && localPlayersArray > 0x10000000) {
-            // Get first element of TArray (index 0)
             uintptr_t lp = ReadMemory_Old<uintptr_t>(localPlayersArray);
             if (lp && lp > 0x10000000) {
-                // Scan for PlayerController offset
                 uintptr_t controllerOffsets[] = {0x30, 0x38, 0x40};
                 for (uintptr_t offset : controllerOffsets) {
                     g_Controller = ReadMemory_Old<uintptr_t>(lp + offset);
@@ -400,7 +395,6 @@ static void InitializePointers() {
                 if (g_Controller && g_Controller > 0x10000000) {
                     g_CameraManager = ReadMemory_Old<uintptr_t>(g_Controller + 0x4D0);
                     
-                    // Get local pawn and position
                     g_LocalPawn = ReadMemory_Old<uintptr_t>(g_Controller + 0x4B8);
                     if (g_LocalPawn && g_LocalPawn > 0x10000000) {
                         uintptr_t rootComp = ReadMemory_Old<uintptr_t>(g_LocalPawn + 0x208);
@@ -422,13 +416,12 @@ static void InitializePointers() {
         }
     }
     
-    // Mark as initialized if we have the critical components
     if (g_GWorld && g_ActorArray && g_ActorCount > 0 && g_Controller && g_CameraManager) {
         g_Initialized = true;
     }
 }
 
-// --- Safe W2S Functions using FMatrix16 with proper row-major handling ---
+// --- Safe W2S Functions ---
 static bool GetViewProjectionMatrices(uintptr_t CameraManager, float* outViewMatrix, float* outProjMatrix) {
     if (!CameraManager) return false;
     uintptr_t cacheAddr = CameraManager + 0x4B0;
@@ -439,7 +432,6 @@ static bool GetViewProjectionMatrices(uintptr_t CameraManager, float* outViewMat
     FMatrix16 viewMat = ReadMemory_Old<FMatrix16>(povAddr + g_ViewMatOff);
     FMatrix16 projMat = ReadMemory_Old<FMatrix16>(povAddr + g_ProjMatOff);
     
-    // Transpose for Metal compatibility
     for (int i = 0; i < 4; i++) {
         for (int j = 0; j < 4; j++) {
             outViewMatrix[i * 4 + j] = viewMat.M[j * 4 + i];
@@ -565,7 +557,6 @@ static CGRect g_ImGuiWindowRect = CGRectZero;
     io.DisplayFramebufferScale = ImVec2(framebufferScale, framebufferScale);
     io.DeltaTime = 1 / float(view.preferredFramesPerSecond ?: 120);
 
-    // Re-initialize if not initialized or lost
     if (!g_Initialized || !g_GWorld || !g_ActorArray || g_ActorCount <= 0) {
         InitializePointers();
     }
@@ -610,12 +601,10 @@ static CGRect g_ImGuiWindowRect = CGRectZero;
             g_ImGuiWindowRect = CGRectZero;
         }
 
-        // =========================================================
-        // INJECTED PUBG 4.5 ESP SNAPLINE
-        // =========================================================
+        // --- Pubg Line ESP ---
         RenderPubgLineESP();
 
-        // --- ESP Drawing (Original) ---
+        // --- ESP Drawing ---
         ImDrawList* drawList = ImGui::GetForegroundDrawList();
         float viewWidth = view.bounds.size.width;
         float viewHeight = view.bounds.size.height;
@@ -644,7 +633,6 @@ static CGRect g_ImGuiWindowRect = CGRectZero;
                 Vector3_Old actorPos = ReadMemory_Old<Vector3_Old>(rootComp + 0x120);
                 if (actorPos.X == 0 && actorPos.Y == 0 && actorPos.Z == 0) continue;
 
-                // Calculate relative distance
                 float dx = actorPos.X - g_LocalPlayerPos.X;
                 float dy = actorPos.Y - g_LocalPlayerPos.Y;
                 float dz = actorPos.Z - g_LocalPlayerPos.Z;
@@ -726,4 +714,31 @@ static CGRect g_ImGuiWindowRect = CGRectZero;
         }
 
         // --- Diagnostics Window ---
-        if (show_D
+        if (show_Diagnostics) {
+            ImGui::Begin("Diagnostics", &show_Diagnostics);
+            ImGui::Text("Base: 0x%lx", g_BaseAddress);
+            ImGui::Text("GWorld: 0x%lx", g_GWorld);
+            ImGui::Text("Actors: %d", g_ActorCount);
+            ImGui::Text("Controller: 0x%lx", g_Controller);
+            ImGui::Text("CameraManager: 0x%lx", g_CameraManager);
+            ImGui::End();
+        }
+
+        // --- Render ImGui Frame ---
+        ImGui::Render();
+        ImDrawData* draw_data = ImGui::GetDrawData();
+        ImGui_ImplMetal_RenderDrawData(draw_data, commandBuffer, renderEncoder);
+
+        [renderEncoder popDebugGroup];
+        [renderEncoder endEncoding];
+        [commandBuffer presentDrawable:view.currentDrawable];
+    }
+
+    [commandBuffer commit];
+}
+
+- (void)mtkView:(nonnull MTKView *)view drawableSizeWillChange:(CGSize)size {
+    // Handling resize event
+}
+
+@end
